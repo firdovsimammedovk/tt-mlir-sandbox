@@ -1,0 +1,189 @@
+# This workflow automates creation of uplift pull requests.
+# Uplift PR is created daily to uplift the submodule to the latest version.
+
+name: Nightly Uplift
+
+on:
+  schedule:
+    - cron: '0 6 * * *'  # Runs at 06:00 UTC every day
+  workflow_dispatch:  # Manual trigger
+    inputs:
+      branch_name:
+        description: 'Branch name for the uplift PR'
+        required: false
+        type: string
+        default: 'uplift'
+      custom_metal_commit_hash:
+        description: '(optional) Custom commit hash for tt-metal to point uplift branch to. Default to current tip of metal main. Does not permit metal version downgrade or non-metal-main commit.'
+        required: false
+        type: string
+      create_draft_pr:
+        description: 'Create the PR in draft mode'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  uplift-pr:
+    runs-on: ubuntu-latest
+
+    env:
+      TT_METAL_SUBMODULE_PATH: third_party/tt-metal
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          ref: main
+
+      - name: Set env variable for today's date
+        run: |
+          echo "TODAY=$(date +'%Y-%m-%d')" >> $GITHUB_ENV
+
+      - name: Check if branch already exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH_NAME: ${{ inputs.branch_name || 'uplift' }}
+        run: |
+          # Allow overwrites for the default "uplift" branch
+          if [ "$BRANCH_NAME" = "uplift" ]; then
+            echo "Using default 'uplift' branch. Overwrites are allowed."
+            exit 0
+          fi
+
+          # For custom branch names, exit if the branch already exists
+          if git ls-remote --exit-code --heads origin "$BRANCH_NAME" >/dev/null 2>&1; then
+            echo "::error::Branch '$BRANCH_NAME' already exists. Exiting to avoid overwriting."
+            echo "::error::Please delete the existing branch first or choose a different branch name."
+            exit 1
+          fi
+          echo "Branch '$BRANCH_NAME' does not exist. Proceeding with uplift."
+
+      - name: Determine tt-metal version to uplift to
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -n "${{ inputs.custom_metal_commit_hash }}" ]; then
+            UPLIFTED_TT_METAL_VERSION="${{ inputs.custom_metal_commit_hash }}"
+            echo "Using custom tt-metal commit hash: $UPLIFTED_TT_METAL_VERSION"
+          else
+            UPLIFTED_TT_METAL_VERSION=$(gh api repos/tenstorrent/tt-metal/commits/main --jq '.sha')
+            echo "Using latest tt-metal commit from main: $UPLIFTED_TT_METAL_VERSION"
+          fi
+          echo "UPLIFTED_TT_METAL_VERSION=$UPLIFTED_TT_METAL_VERSION" >> $GITHUB_ENV
+
+      - name: Validate no downgrade + using main when using custom commit hash for safety
+        if: ${{ inputs.custom_metal_commit_hash }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          CURRENT_TT_METAL_VERSION_REF=$(grep 'set(TT_METAL_VERSION' third_party/CMakeLists.txt | sed 's/.*"\(.*\)".*/\1/')
+          CURRENT_TT_METAL_VERSION=$(gh api repos/tenstorrent/tt-metal/commits/$CURRENT_TT_METAL_VERSION_REF --jq '.sha')
+          echo "Current tt-metal version ref: $CURRENT_TT_METAL_VERSION_REF"
+          echo "Current tt-metal version (resolved SHA): $CURRENT_TT_METAL_VERSION"
+          echo "Custom tt-metal version: ${{ env.UPLIFTED_TT_METAL_VERSION }}"
+
+          # Verify custom commit is on main metal branch
+          MAIN_TIP=$(gh api repos/tenstorrent/tt-metal/commits/main --jq '.sha')
+          COMPARE_TO_MAIN=$(gh api repos/tenstorrent/tt-metal/compare/${{ env.UPLIFTED_TT_METAL_VERSION }}...${MAIN_TIP} --jq '.status')
+
+          if [ "$COMPARE_TO_MAIN" = "diverged" ]; then
+            echo "::error::Custom commit hash ${{ env.UPLIFTED_TT_METAL_VERSION }} is not on the main branch"
+            echo "::error::Please use a commit hash from the main branch."
+            exit 1
+          fi
+
+          echo "Validation passed: Custom commit is on main branch"
+
+          # Verify custom commit is not a downgrade from current version
+          COMPARE_RESULT=$(gh api repos/tenstorrent/tt-metal/compare/${CURRENT_TT_METAL_VERSION}...${{ env.UPLIFTED_TT_METAL_VERSION }} --jq '.status')
+
+          if [ "$COMPARE_RESULT" = "behind" ]; then
+            echo "::error::Custom commit hash ${{ env.UPLIFTED_TT_METAL_VERSION }} would be a downgrade from current version $CURRENT_TT_METAL_VERSION (status: $COMPARE_RESULT)"
+            echo "::error::Please use a commit hash that is ahead of the current version."
+            exit 1
+          fi
+
+          echo "Validation passed: Custom commit is $COMPARE_RESULT current version"
+
+      - name: Check for dependency file changes and update Dockerfile
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          CURRENT_TT_METAL_VERSION_REF=$(grep 'set(TT_METAL_VERSION' third_party/CMakeLists.txt | sed 's/.*"\(.*\)".*/\1/')
+          CURRENT_TT_METAL_VERSION=$(gh api repos/tenstorrent/tt-metal/commits/$CURRENT_TT_METAL_VERSION_REF --jq '.sha')
+          echo "Current tt-metal version ref: $CURRENT_TT_METAL_VERSION_REF"
+          echo "Current tt-metal version (resolved SHA): $CURRENT_TT_METAL_VERSION"
+
+          # Fetch file hashes from current version
+          CURRENT_INSTALL_DEPS_SHA=$(gh api repos/tenstorrent/tt-metal/contents/install_dependencies.sh?ref=$CURRENT_TT_METAL_VERSION --jq '.sha' 2>/dev/null || echo "not_found")
+          CURRENT_SFPI_INFO_SHA=$(gh api repos/tenstorrent/tt-metal/contents/tt_metal/sfpi-info.sh?ref=$CURRENT_TT_METAL_VERSION --jq '.sha' 2>/dev/null || echo "not_found")
+          CURRENT_SFPI_VERSION_SHA=$(gh api repos/tenstorrent/tt-metal/contents/tt_metal/sfpi-version?ref=$CURRENT_TT_METAL_VERSION --jq '.sha' 2>/dev/null || echo "not_found")
+          CURRENT_EXALENS_VERSION_SHA=$(gh api repos/tenstorrent/tt-metal/contents/scripts/ttexalens_ref.txt?ref=$CURRENT_TT_METAL_VERSION --jq '.sha' 2>/dev/null || echo "not_found")
+
+          # Fetch file hashes from uplifted version
+          LATEST_INSTALL_DEPS_SHA=$(gh api repos/tenstorrent/tt-metal/contents/install_dependencies.sh?ref=${{ env.UPLIFTED_TT_METAL_VERSION }} --jq '.sha' 2>/dev/null || echo "not_found")
+          LATEST_SFPI_INFO_SHA=$(gh api repos/tenstorrent/tt-metal/contents/tt_metal/sfpi-info.sh?ref=${{ env.UPLIFTED_TT_METAL_VERSION }} --jq '.sha' 2>/dev/null || echo "not_found")
+          LATEST_SFPI_VERSION_SHA=$(gh api repos/tenstorrent/tt-metal/contents/tt_metal/sfpi-version?ref=${{ env.UPLIFTED_TT_METAL_VERSION }} --jq '.sha' 2>/dev/null || echo "not_found")
+          LATEST_EXALENS_VERSION_SHA=$(gh api repos/tenstorrent/tt-metal/contents/scripts/ttexalens_ref.txt?ref=${{ env.UPLIFTED_TT_METAL_VERSION }} --jq '.sha' 2>/dev/null || echo "not_found")
+
+          if [ "$CURRENT_INSTALL_DEPS_SHA" != "$LATEST_INSTALL_DEPS_SHA" ] || \
+             [ "$CURRENT_SFPI_INFO_SHA" != "$LATEST_SFPI_INFO_SHA" ] || \
+             [ "$CURRENT_EXALENS_VERSION_SHA" != "$LATEST_EXALENS_VERSION_SHA" ] || \
+             [ "$CURRENT_SFPI_VERSION_SHA" != "$LATEST_SFPI_VERSION_SHA" ]; then
+            # Update the commit hash in Dockerfile.base
+            sed -i "s|ARG TT_METAL_DEPENDENCIES_COMMIT=.*|ARG TT_METAL_DEPENDENCIES_COMMIT=${{ env.UPLIFTED_TT_METAL_VERSION }}|" .github/Dockerfile.base
+            DOCKERFILE_UPDATED="**Note** Dockerfile.base is modified due to dependency updates"
+            echo "DOCKERFILE_UPDATED=$DOCKERFILE_UPDATED" >> $GITHUB_ENV
+          fi
+
+      - name: Update tt-metal reference in third_party/CMakeLists.txt
+        run: |
+          echo "Updating tt-metal to SHA: ${{ env.UPLIFTED_TT_METAL_VERSION }}"
+          sed -i "s/set(TT_METAL_VERSION \".*\")/set(TT_METAL_VERSION \"${{ env.UPLIFTED_TT_METAL_VERSION }}\")/" third_party/CMakeLists.txt
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v8
+        id: create-pr
+        with:
+          branch: ${{ inputs.branch_name || 'uplift' }}
+          committer: github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>
+          author: ${{ github.actor }} <${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com>
+          base: main
+          draft: ${{ inputs.create_draft_pr || false }}
+          commit-message: "Uplift ${{ env.TT_METAL_SUBMODULE_PATH }} to ${{ env.UPLIFTED_TT_METAL_VERSION }} ${{ env.TODAY }}"
+          title: "Uplift ${{ env.TT_METAL_SUBMODULE_PATH }} to ${{ env.UPLIFTED_TT_METAL_VERSION }} ${{ env.TODAY }}"
+          body: |
+            This PR uplifts the ${{ env.TT_METAL_SUBMODULE_PATH }} to the ${{ env.UPLIFTED_TT_METAL_VERSION }}
+
+            ${{ env.DOCKERFILE_UPDATED }}
+
+            ### Checklist
+            - **Frontend CI passing links**
+              - [ ] [tt-forge-onnx](https://github.com/tenstorrent/tt-forge-onnx/actions/workflows/on-pr.yml):
+              - [ ] [tt-xla (full-mlir-uplift-qualification.json)](https://github.com/tenstorrent/tt-xla/actions/workflows/manual-test.yml):
+            - **Follow-up Actions**
+              - [ ] **Issues filed** to follow up on incomplete changes (if any):
+              - [ ] **Frontend fix PRs** ready (if needed by this uplift):
+          labels: uplift
+          delete-branch: true
+          token: ${{ secrets.GH_TOKEN }}
+
+      - name: Approve Pull Request
+        if: ${{ steps.create-pr.outputs.pull-request-number }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_APPROVE_TOKEN }}
+        run: |
+          echo "Pull Request Number - ${{ steps.create-pr.outputs.pull-request-number }}"
+          echo "Pull Request URL - ${{ steps.create-pr.outputs.pull-request-url }}"
+          gh pr review ${{ steps.create-pr.outputs.pull-request-number }} --approve
+
+      # Note: Disable auto-merge for now until we are more confident
+      # that uplift won't break the downstream projects
+      #
+      # - name: Enable Pull Request Automerge
+      #   if: ${{ steps.create-pr.outputs.pull-request-number }}
+      #   run: gh pr merge --squash --auto "${{ steps.create-pr.outputs.pull-request-number }}"
+      #   env:
+      #     GH_TOKEN: ${{ secrets.GH_TOKEN }}

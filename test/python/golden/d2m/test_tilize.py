@@ -1,0 +1,425 @@
+# SPDX-FileCopyrightText: (c) 2025 Tenstorrent AI ULC
+#
+# SPDX-License-Identifier: Apache-2.0
+
+import pytest
+import torch
+from pathlib import Path
+from typing import List
+from conftest import get_request_kwargs
+from test_utils import SkipIf
+
+from ttmlir.dialects import ttcore
+from ttmlir.ir import *
+
+from builder.base.builder_utils import Operand, Shape
+from builder.d2m.d2m_builder import D2MBuilder
+from builder.base.builder_apis import compile_and_execute_d2m
+
+
+pytestmark = pytest.mark.frontend("ttir")
+
+
+D2M_TILIZE_PIPELINE = (
+    "ttcore-mark-functions-as-forward,d2m-lower-to-layout,canonicalize,"
+    "ttir-bufferization-pipeline,d2m-insert-scratch-buffers,"
+    "d2m-generic-apply-interchange,d2m-generate-outer-loops,"
+    "d2m-reblock-generics,d2m-allocate,"
+    "d2m-lower-multicast-loads,d2m-generic-lower-to-explicit-form,"
+    "canonicalize,d2m-be-pipeline,d2m-to-ttkernel-pipeline,"
+    "d2m-to-ttmetal-pipeline"
+)
+
+
+def assert_reblocked_ir(ir_dump_dir: Path, op_name: str, block_factors: str):
+    for path in sorted(ir_dump_dir.rglob("*.mlir")):
+        ir = path.read_text()
+        if op_name in ir and block_factors in ir:
+            return
+
+    dumped_files = "\n".join(str(path) for path in sorted(ir_dump_dir.rglob("*")))
+    raise AssertionError(
+        f"Did not find {op_name} with {block_factors} in IR dumps:\n{dumped_files}"
+    )
+
+
+def tilize_golden(input_tensor):
+    shape = input_tensor.shape
+    TILE_SIZE = 32
+    FACE_SIZE = 16
+    Y_TILES = shape[0] // TILE_SIZE
+    X_TILES = shape[1] // TILE_SIZE
+    FACES_PER_TILE = TILE_SIZE // FACE_SIZE
+
+    tilized = torch.zeros_like(input_tensor)
+    tilized = tilized.flatten()
+
+    idx = 0
+    for tile_y in range(Y_TILES):
+        for tile_x in range(X_TILES):
+            for face_y in range(FACES_PER_TILE):
+                for face_x in range(FACES_PER_TILE):
+                    for datum_y in range(FACE_SIZE):
+                        for datum_x in range(FACE_SIZE):
+                            tilized[idx] = input_tensor[
+                                datum_y + tile_y * TILE_SIZE + face_y * FACE_SIZE,
+                                datum_x + tile_x * TILE_SIZE + face_x * FACE_SIZE,
+                            ]
+                            idx += 1
+
+    tilized = tilized.reshape(shape)
+    return tilized
+
+
+def untilize_golden(input_tensor):
+    shape = input_tensor.shape
+    TILE_SIZE = 32
+    FACE_SIZE = 16
+    Y_TILES = shape[0] // TILE_SIZE
+    X_TILES = shape[1] // TILE_SIZE
+    FACES_PER_TILE = TILE_SIZE // FACE_SIZE
+
+    untilized = torch.zeros_like(input_tensor)
+    flattened = input_tensor.clone()
+    flattened = flattened.flatten()
+
+    idx = 0
+    for tile_y in range(Y_TILES):
+        for tile_x in range(X_TILES):
+            for face_y in range(FACES_PER_TILE):
+                for face_x in range(FACES_PER_TILE):
+                    for datum_y in range(FACE_SIZE):
+                        for datum_x in range(FACE_SIZE):
+                            # Calculate the original position
+                            orig_y = datum_y + tile_y * TILE_SIZE + face_y * FACE_SIZE
+                            orig_x = datum_x + tile_x * TILE_SIZE + face_x * FACE_SIZE
+
+                            # Place the value from the tilized tensor back to its original position
+                            untilized[orig_y, orig_x] = flattened[idx]
+                            idx += 1
+
+    return untilized
+
+
+@pytest.mark.parametrize("target", ["ttmetal"])
+def test_tilize_auto_reblock(target: str, request, device, tmp_path: Path):
+    shape = (256, 256)
+    dtype = torch.float32
+    test_base = request.node.name
+    ir_dump_dir = tmp_path / "ir_dumps"
+
+    def module(builder: D2MBuilder):
+        in_golden = torch.randn(shape, dtype=dtype)
+        out_golden = tilize_golden(in_golden)
+
+        @builder.func([shape], [dtype])
+        def tilize(
+            in0: Operand,
+            builder: D2MBuilder,
+            unit_attrs: List[str] = None,
+        ):
+            to_device = builder.tilize(
+                in0,
+                output_type=builder.get_metal_tensor_layout(
+                    shape, tiled=True, grid=(1, 1), element_dtype=dtype
+                ),
+                unit_attrs=unit_attrs,
+            )
+
+            id_map = AffineMap.get_identity(2 * len(shape), builder._ctx)
+            view_as_rm = builder.view_layout(
+                to_device,
+                output_type=builder.get_metal_tensor_layout(
+                    shape, tiled=False, grid=(1, 1), element_dtype=dtype
+                ),
+                remapping=id_map,
+                reinterpret_layout=True,
+                unit_attrs=unit_attrs,
+            )
+
+            from_device = builder.to_layout(
+                view_as_rm,
+                output_type=in0.type,
+                unit_attrs=unit_attrs,
+            )
+
+            builder.set_goldens({in0: in_golden}, {from_device: out_golden})
+            return from_device
+
+    kwargs = get_request_kwargs(request)
+    kwargs.update(
+        test_base=test_base,
+        output_root=str(tmp_path),
+        save_artifacts=True,
+        print_ir=str(ir_dump_dir),
+        check_pcc=True,
+    )
+    compile_and_execute_d2m(
+        module,
+        target=target,
+        custom_pipeline=D2M_TILIZE_PIPELINE,
+        device=device,
+        **kwargs,
+    )
+
+    assert_reblocked_ir(ir_dump_dir, "d2m.tile_tilize_block", "block_factors = [8, 1]")
+
+
+@pytest.mark.parametrize("target", ["ttmetal"])
+def test_untilize_auto_reblock(target: str, request, device, tmp_path: Path):
+    shape = (256, 256)
+    dtype = torch.float32
+    test_base = request.node.name
+    ir_dump_dir = tmp_path / "ir_dumps"
+
+    def module(builder: D2MBuilder):
+        in_golden = torch.randn(shape, dtype=dtype)
+        out_golden = in_golden
+
+        @builder.func([shape], [dtype])
+        def untilize(
+            in0: Operand,
+            builder: D2MBuilder,
+            unit_attrs: List[str] = None,
+        ):
+            tiled = builder.tilize(
+                in0,
+                output_type=builder.get_metal_tensor_layout(
+                    shape, tiled=True, grid=(1, 1), element_dtype=dtype
+                ),
+                unit_attrs=unit_attrs,
+            )
+
+            from_device = builder.untilize(
+                tiled,
+                output_type=in0.type,
+                unit_attrs=unit_attrs,
+            )
+
+            builder.set_goldens({in0: in_golden}, {from_device: out_golden})
+            return from_device
+
+    kwargs = get_request_kwargs(request)
+    kwargs.update(
+        test_base=test_base,
+        output_root=str(tmp_path),
+        save_artifacts=True,
+        print_ir=str(ir_dump_dir),
+        check_pcc=True,
+    )
+    compile_and_execute_d2m(
+        module,
+        target=target,
+        custom_pipeline=D2M_TILIZE_PIPELINE,
+        device=device,
+        **kwargs,
+    )
+
+    assert_reblocked_ir(
+        ir_dump_dir, "d2m.tile_untilize_block", "block_factors = [8, 2]"
+    )
+
+
+@pytest.mark.parametrize("shape", [(32, 64), (64, 32), (64, 64), (64, 128)])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        torch.float32,
+        torch.int32
+        | SkipIf(
+            ["n150", "sim"],
+            ["n300", "sim"],
+            ["llmbox", "sim"],
+            ["tg", "sim"],
+            reason="A hardware bug workaround in LLK is causing UndefinedBehavior in the unpacker in WH (not BH).",
+        ),
+        torch.bfloat16,
+        torch.uint16,
+    ],
+    ids=["f32", "i32", "bf16", "u16"],
+)
+@pytest.mark.parametrize("target", ["ttmetal"])
+def test_tilize(shape: Shape, target: str, dtype: torch.dtype, request, device):
+    def module(builder: D2MBuilder):
+        if dtype.is_floating_point:
+            in_golden = torch.randn(shape, dtype=dtype)
+        else:
+            in_golden = torch.randint(100, shape, dtype=dtype)
+        out_golden = tilize_golden(in_golden)
+
+        @builder.func([shape], [dtype])
+        def tilize(
+            in0: Operand,
+            builder: D2MBuilder,
+            unit_attrs: List[str] = None,
+        ):
+
+            to_device = builder.tilize(
+                in0,
+                output_type=builder.get_metal_tensor_layout(
+                    shape, tiled=True, element_dtype=dtype
+                ),
+                unit_attrs=unit_attrs,
+            )
+
+            # Provide an explicit identity remapping for the view op.
+            id_map = AffineMap.get_identity(2 * len(shape), builder._ctx)
+            view_as_rm = builder.view_layout(
+                to_device,
+                output_type=builder.get_metal_tensor_layout(
+                    shape, tiled=False, element_dtype=dtype
+                ),
+                remapping=id_map,
+                reinterpret_layout=True,
+                unit_attrs=unit_attrs,
+            )
+
+            from_device = builder.to_layout(
+                view_as_rm,
+                output_type=in0.type,
+                unit_attrs=unit_attrs,
+            )
+
+            builder.set_goldens({in0: in_golden}, {from_device: out_golden})
+
+            return from_device
+
+    compile_and_execute_d2m(
+        module,
+        target=target,
+        custom_pipeline="d2m-lower-to-layout,canonicalize,ttir-bufferization-pipeline,d2m-insert-scratch-buffers,d2m-generic-apply-interchange,d2m-generate-outer-loops,d2m-allocate,d2m-lower-multicast-loads,d2m-generic-lower-to-explicit-form,canonicalize,d2m-be-pipeline,d2m-to-ttkernel-pipeline,d2m-to-ttmetal-pipeline",
+        device=device,
+        **get_request_kwargs(request),
+    )
+
+
+@pytest.mark.parametrize("shape", [(32, 64), (64, 32), (64, 64), (64, 128)])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        torch.float32,
+        torch.int32
+        | SkipIf(
+            ["n150", "sim"],
+            ["n300", "sim"],
+            ["llmbox", "sim"],
+            ["tg", "sim"],
+            reason="A hardware bug workaround in LLK is causing UndefinedBehavior in the unpacker in WH (not BH).",
+        ),
+        torch.bfloat16,
+        torch.uint16,
+    ],
+    ids=["f32", "i32", "bf16", "u16"],
+)
+@pytest.mark.parametrize("target", ["ttmetal"])
+def test_untilize(shape: Shape, target: str, dtype: torch.dtype, request, device):
+    def module(builder: D2MBuilder):
+        if dtype.is_floating_point:
+            in_golden = torch.randn(shape, dtype=dtype)
+        else:
+            in_golden = torch.randint(100, shape, dtype=dtype)
+        out_golden = untilize_golden(in_golden)
+
+        @builder.func([shape], [dtype])
+        def untilize(
+            in0: Operand,
+            builder: D2MBuilder,
+            unit_attrs: List[str] = None,
+        ):
+            to_device = builder.to_layout(
+                in0,
+                output_type=builder.get_metal_tensor_layout(
+                    shape, tiled=False, grid=(1, 1), element_dtype=dtype
+                ),
+                unit_attrs=unit_attrs,
+            )
+
+            # Provide an explicit identity remapping for the view op.
+            id_map = AffineMap.get_identity(2 * len(shape), builder._ctx)
+            view_as_tiled = builder.view_layout(
+                to_device,
+                output_type=builder.get_metal_tensor_layout(
+                    shape, grid=(1, 1), tiled=True, element_dtype=dtype
+                ),
+                remapping=id_map,
+                reinterpret_layout=True,
+                unit_attrs=unit_attrs,
+            )
+
+            from_device = builder.untilize(
+                view_as_tiled,
+                output_type=in0.type,
+                unit_attrs=unit_attrs,
+            )
+
+            builder.set_goldens({in0: in_golden}, {from_device: out_golden})
+
+            return from_device
+
+    compile_and_execute_d2m(
+        module,
+        target=target,
+        custom_pipeline="d2m-lower-to-layout,canonicalize,ttir-bufferization-pipeline,d2m-insert-scratch-buffers,d2m-generic-apply-interchange,d2m-generate-outer-loops,d2m-allocate,d2m-lower-multicast-loads,d2m-generic-lower-to-explicit-form,canonicalize,d2m-be-pipeline,d2m-to-ttkernel-pipeline,d2m-to-ttmetal-pipeline",
+        device=device,
+        **get_request_kwargs(request),
+    )
+
+
+@pytest.mark.parametrize("shape", [(32, 64), (64, 32), (64, 64)])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        torch.float32,
+        torch.int32
+        | SkipIf(
+            ["n150", "sim"],
+            ["n300", "sim"],
+            ["llmbox", "sim"],
+            ["tg", "sim"],
+            reason="A hardware bug workaround in LLK is causing UndefinedBehavior in the unpacker in WH (not BH).",
+        ),
+        torch.bfloat16,
+        torch.uint16,
+    ],
+    ids=["f32", "i32", "bf16", "u16"],
+)
+@pytest.mark.parametrize("target", ["ttmetal"])
+def test_tilize_untilize(
+    shape: Shape, target: str, dtype: torch.dtype, request, device
+):
+    def module(builder: D2MBuilder):
+        if dtype.is_floating_point:
+            golden = torch.randn(shape, dtype=dtype)
+        else:
+            golden = torch.randint(100, shape, dtype=dtype)
+
+        @builder.func([shape], [dtype])
+        def tilize_untilize(
+            in0: Operand,
+            builder: D2MBuilder,
+            unit_attrs: List[str] = None,
+        ):
+            to_device = builder.tilize(
+                in0,
+                output_type=builder.get_metal_tensor_layout(
+                    shape, tiled=True, grid=(1, 1), element_dtype=dtype
+                ),
+                unit_attrs=unit_attrs,
+            )
+            from_device = builder.untilize(
+                to_device,
+                output_type=in0.type,
+                unit_attrs=unit_attrs,
+            )
+
+            builder.set_goldens({in0: golden}, {from_device: golden})
+
+            return from_device
+
+    compile_and_execute_d2m(
+        module,
+        target=target,
+        custom_pipeline="d2m-lower-to-layout,canonicalize,ttir-bufferization-pipeline,d2m-insert-scratch-buffers,d2m-generic-apply-interchange,d2m-generate-outer-loops,d2m-allocate,d2m-lower-multicast-loads,d2m-generic-lower-to-explicit-form,canonicalize,d2m-be-pipeline,d2m-to-ttkernel-pipeline,d2m-to-ttmetal-pipeline",
+        device=device,
+        **get_request_kwargs(request),
+    )

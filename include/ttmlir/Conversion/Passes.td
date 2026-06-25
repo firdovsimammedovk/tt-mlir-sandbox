@@ -1,0 +1,435 @@
+// SPDX-FileCopyrightText: (c) 2024 Tenstorrent AI ULC
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#ifndef TTMLIR_CONVERSION_PASSES
+#define TTMLIR_CONVERSION_PASSES
+
+include "mlir/Pass/PassBase.td"
+
+#ifdef TTMLIR_ENABLE_STABLEHLO
+def ConvertStableHLOToTTIR : Pass<"convert-stablehlo-to-ttir", "::mlir::ModuleOp"> {
+let summary = "Convert StableHLO dialect to TTIR dialect.";
+  let constructor = "createConvertStableHLOToTTIRPass()";
+  let dependentDialects = ["mlir::stablehlo::StablehloDialect", "mlir::sdy::SdyDialect", "mlir::tt::ttir::TTIRDialect"];
+  let options = [
+    Option<"enablePartialConversion", "enable-partial-conversion", "bool",
+      /*default=*/"false",
+      "Enable partial conversion mode, allowing unconverted ops to remain">
+  ];
+}
+def ConvertArithToStableHLO : Pass<"convert-arith-to-stablehlo", "::mlir::ModuleOp"> {
+let summary = "Convert Arith Dialect to StableHLO dialect.";
+  let constructor = "createConvertArithToStableHLOPass()";
+  let dependentDialects = ["mlir::stablehlo::StablehloDialect", "mlir::sdy::SdyDialect", "mlir::arith::ArithDialect"];
+}
+def LegalizeStableHLOCompositeToTTIR : Pass<"legalize-stablehlo-composite-to-ttir", "::mlir::ModuleOp"> {
+  let summary = "Legalize StableHLO composite operations directly to TTIR.";
+  let constructor = "createLegalizeStableHLOCompositeToTTIRPass()";
+  let description = [{
+    This pass legalizes StableHLO composite operations based on the name attribute
+    directly to the corresponding TTIR operations.
+    This allows us to avoid the need for brittle fusion patterns.
+  }];
+
+  let dependentDialects = ["mlir::stablehlo::StablehloDialect", "mlir::tt::ttir::TTIRDialect"];
+}
+#endif
+
+def ConvertTosaToTTIR : Pass<"convert-tosa-to-ttir", "::mlir::ModuleOp"> {
+  let summary = "Convert TOSA dialect to TTIR dialect.";
+  let constructor = "createConvertTosaToTTIRPass()";
+  let dependentDialects = ["mlir::tt::ttir::TTIRDialect"];
+}
+
+def TTIRToTTIRDecomposition: Pass<"ttir-to-ttir-decomposition", "::mlir::ModuleOp"> {
+  let summary = "Decomposes TTIR operations into simpler TTIR operations.";
+  let constructor = "createTTIRToTTIRDecompositionPass()";
+  let dependentDialects = ["mlir::tt::ttir::TTIRDialect"];
+
+  let options = [
+    Option<"decompConfig", "config", "::mlir::tt::DecompMode", /*default=*/"::mlir::tt::DecompMode::TTNN",
+           "Decomposition configuration for different backends",
+           [{::llvm::cl::values(
+             clEnumValN(::mlir::tt::DecompMode::TTNN, "ttnn",
+                        "Default configuration for TTNN backend"),
+             clEnumValN(::mlir::tt::DecompMode::TTMetal, "ttmetal",
+                        "Configuration for TTMetal backend"),
+             clEnumValN(::mlir::tt::DecompMode::CPUFallback, "cpu-fallback",
+                        "Configuration for CPU fallback path")
+           )}]>
+  ];
+}
+
+
+def TTIRToD2M: Pass<"ttir-to-d2m", "::mlir::ModuleOp"> {
+  let summary = "Convert named TTIR operations to their D2M form.";
+  let description = [{
+    This pass converts ttir "named" ops to a nested d2m.generic/linalg.generic structure, with
+    d2m.generic denoting the available degrees of parallelism across a grid of cores
+    and linalg.generic adding another level of nesting for a single core's data movement/compute
+    task. This conversion will do an appropriate decomposition of the original op
+    into lower-level tiled/blocked ops.
+    Additionally it handles layout transitions from the original graph on tensors, to tensors
+    with a ttcore.metal_layout encoding attribute.  This enables ops to override the default layout
+    if needed.
+    Example:
+    ```mlir
+      %0 = ttir.empty() : tensor<256x1024xf32>
+      %1 = "ttir.matmul"(%arg0, %arg1, %0) : (tensor<256x768xf32>, tensor<768x1024xf32>, tensor<256x1024xf32>) -> tensor<256x1024xf32>
+    ```
+    becomes (post-canonicalization)
+    ```mlir
+      #l1_ = #ttcore.memory_space<l1>
+      #map = affine_map<(d0, d1, d2) -> (d0, d2)>
+      #map1 = affine_map<(d0, d1, d2) -> (d2, d1)>
+      #map2 = affine_map<(d0, d1, d2) -> (d0, d1)>
+      #parallel = #ttcore.iterator_type<parallel>
+      #reduction = #ttcore.iterator_type<reduction>
+      #layout = #ttcore.metal_layout<(d0, d1) -> (d0, d1), undef, <1x1>, memref<8x24x!ttcore.tile<32x32, f32>, #l1_>>
+      #layout1 = #ttcore.metal_layout<(d0, d1) -> (d0, d1), undef, <1x1>, memref<24x32x!ttcore.tile<32x32, f32>, #l1_>>
+      #layout2 = #ttcore.metal_layout<(d0, d1) -> (d0, d1), undef, <1x1>, memref<8x32x!ttcore.tile<32x32, f32>, #l1_>>
+      %0 = d2m.empty() : tensor<256x768xf32, #layout>
+      %1 = "d2m.to_layout"(%arg0, %0) : (tensor<256x768xf32>, tensor<256x768xf32, #layout>) -> tensor<256x768xf32, #layout>
+      %2 = d2m.empty() : tensor<768x1024xf32, #layout1>
+      %3 = "d2m.to_layout"(%arg1, %2) : (tensor<768x1024xf32>, tensor<768x1024xf32, #layout1>) -> tensor<768x1024xf32, #layout1>
+      %4 = d2m.empty() : tensor<256x1024xf32, #layout2>
+      %5 = d2m.generic {grid = #ttcore.grid<1x1>, indexing_maps = [#map, #map1, #map2], iterator_types = [#parallel, #parallel, #reduction], threads = [#d2m.thread<compute>]}
+          ins(%1, %3 : tensor<256x768xf32, #layout>, tensor<768x1024xf32, #layout1>)
+          outs(%4 : tensor<256x1024xf32, #layout2>)  {
+      ^compute0(%cb0: memref<8x24x!ttcore.tile<32x32, f32>, #l1_>, %cb1: memref<24x32x!ttcore.tile<32x32, f32>, #l1_>, %cb2: memref<8x32x!ttcore.tile<32x32, f32>, #l1_>):
+        "d2m.tile_matmul_block"(%cb0, %cb1, %cb2) : (memref<8x24x!ttcore.tile<32x32, f32>, #l1_>, memref<24x32x!ttcore.tile<32x32, f32>, #l1_>, memref<8x32x!ttcore.tile<32x32, f32>, #l1_>) -> ()
+      } : tensor<256x1024xf32, #layout2>
+      %6 = d2m.empty() : tensor<256x1024xf32>
+      %7 = "d2m.to_layout"(%5, %6) : (tensor<256x1024xf32, #layout2>, tensor<256x1024xf32>) -> tensor<256x1024xf32>
+    ```
+  }];
+  let dependentDialects = ["mlir::tt::ttir::TTIRDialect", "mlir::tt::d2m::D2MDialect", "mlir::linalg::LinalgDialect"];
+  let constructor = "createTTIRToD2MPass()";
+  let options = [
+      Option<"defaultInputMemSpace", "default-input-memspace", "ttcore::MemorySpace", /*default=*/"ttcore::MemorySpace::DeviceL1", "Set default memspace for input tensors",
+          [{::llvm::cl::values(
+            clEnumValN(ttcore::MemorySpace::DeviceL1, "l1", "L1"),
+            clEnumValN(ttcore::MemorySpace::DeviceDRAM, "dram", "DRAM")
+          )}]>,
+      Option<"defaultOutputMemSpace", "default-output-memspace", "ttcore::MemorySpace", /*default=*/"ttcore::MemorySpace::DeviceL1", "Set default memspace for output tensors",
+          [{::llvm::cl::values(
+            clEnumValN(ttcore::MemorySpace::DeviceL1, "l1", "L1"),
+            clEnumValN(ttcore::MemorySpace::DeviceDRAM, "dram", "DRAM")
+          )}]>,
+      Option<"collapseTensorsTo2D", "collapse-tensors-2d", "bool", /*default=*/"true", "Default collapse all tensors to 2D">,
+      Option<"ttnnMode", "ttnn-mode", "bool", /*default=*/"false", "Enable translation of TTNN Tensors">,
+      Option<"enableMulticastInference", "enable-multicast-inference", "bool", /*default=*/"true", "Enable automatic multicast inference for reduction operations">,
+  ];
+}
+
+def ArithToD2MTileOps : Pass<"arith-to-d2m-tile-ops", "::mlir::ModuleOp"> {
+  let summary = "Convert Arith to D2M Tile ops dialect.";
+  let description = [{
+    Take arith ops that operate over tiles and convert them to d2m tile ops.
+    ```mlir
+    %0 = arith.negf %arg0 : !ttcore.tile<32x32, f32>
+    ```
+    Becomes:
+    ```mlir
+    %0 = "d2m.tile_negative"(%arg0) : (!ttcore.tile<32x32, f32>) -> !ttcore.tile<32x32, f32>
+    ```
+  }];
+  let dependentDialects = ["mlir::tt::d2m::D2MDialect", "mlir::linalg::LinalgDialect"];
+  let constructor = "createConvertArithToD2MTileOpsPass()";
+}
+
+def MathToD2MTileOps : Pass<"math-to-d2m-tile-ops", "::mlir::ModuleOp"> {
+  let summary = "Convert Math to D2M Tile ops dialect.";
+  let description = [{
+    Take math ops that operate over tiles and convert them to d2m tile ops.
+    ```mlir
+    %0 = math.abs %arg0 : !ttcore.tile<32x32, f32>
+    ```
+    Becomes:
+    ```mlir
+    %0 = "d2m.tile_abs"(%arg0) : (!ttcore.tile<32x32, f32>) -> !ttcore.tile<32x32, f32>
+    ```
+  }];
+  let dependentDialects = ["mlir::tt::d2m::D2MDialect", "mlir::linalg::LinalgDialect"];
+  let constructor = "createConvertMathToD2MTileOpsPass()";
+}
+
+def ConvertTTIRToTTNN: Pass<"convert-ttir-to-ttnn", "::mlir::ModuleOp"> {
+  let summary = "Convert TTIR dialect to TTNN dialect.";
+  let constructor = "createConvertTTIRToTTNNPass()";
+  let dependentDialects = ["mlir::tt::ttir::TTIRDialect", "mlir::tt::ttnn::TTNNDialect"];
+}
+
+def ConvertD2MToTTMetal: Pass<"convert-d2m-to-ttmetal", "::mlir::ModuleOp"> {
+  let summary = "Convert D2M dialect to TTMetal dialect.";
+  let constructor = "createConvertD2MToTTMetalPass()";
+  let dependentDialects = ["mlir::tt::d2m::D2MDialect", "mlir::tt::ttmetal::TTMetalDialect", "mlir::tt::ttkernel::TTKernelDialect"];
+  let options = [
+    Option<"mathFidelity", "math-fidelity", "mlir::tt::ttmetal::MathFidelity",
+           /*default=*/"mlir::tt::ttmetal::MathFidelity::HiFi4",
+           "Set the math fidelity for compute kernels",
+           [{::llvm::cl::values(
+             clEnumValN(mlir::tt::ttmetal::MathFidelity::LoFi, "LoFi", "LoFi"),
+             clEnumValN(mlir::tt::ttmetal::MathFidelity::HiFi2, "HiFi2", "HiFi2"),
+             clEnumValN(mlir::tt::ttmetal::MathFidelity::HiFi3, "HiFi3", "HiFi3"),
+             clEnumValN(mlir::tt::ttmetal::MathFidelity::HiFi4, "HiFi4", "HiFi4")
+           )}]>
+  ];
+}
+
+def ConvertD2MToTTKernel: Pass<"convert-d2m-to-ttkernel", "::mlir::func::FuncOp"> {
+  let summary = "Convert D2M dialect to TTKernel dialect.";
+  let constructor = "createConvertD2MToTTKernelPass()";
+  let dependentDialects = ["mlir::tt::d2m::D2MDialect", "mlir::tt::ttmetal::TTMetalDialect", "mlir::tt::ttkernel::TTKernelDialect", "mlir::arith::ArithDialect"];
+  let options = [
+    Option<"ttnnMode", "ttnn-mode", "bool", /*default=*/"false", "Enable TTNN mode">,
+    Option<"forceCompileTimeArgs", "force-compile-time-args", "bool", /*default=*/"false",
+           "Force uniform D2M kernel arguments into compile-time args when legal for CRTA performance comparison.">
+  ];
+}
+
+def ConvertTTNNToEmitC : Pass<"convert-ttnn-to-emitc", "::mlir::ModuleOp"> {
+  let summary = "Convert TTNN dialect to EmitC dialect.";
+  let constructor = "createConvertTTNNToEmitCPass()";
+  let dependentDialects = ["mlir::emitc::EmitCDialect", "mlir::tt::ttnn::TTNNDialect"];
+}
+
+def ConvertTTIRCPUToEmitPy : Pass<"convert-ttir-cpu-to-emitpy", "::mlir::ModuleOp"> {
+  let summary = "Convert TTIR CPU-hoisted ops to EmitPy dialect.";
+  let description = [{
+    Lowers TTIR ops to EmitPy CallOpaqueOp calls targeting
+    `ttir_cpu.<mnemonic>` functions — pure-torch implementations that run
+    on the host CPU.
+  }];
+  let constructor = "createConvertTTIRCPUToEmitPyPass()";
+  let dependentDialects = ["mlir::tt::emitpy::EmitPyDialect",
+                           "mlir::tt::ttir::TTIRDialect"];
+}
+
+def ConvertTTNNToEmitPy : Pass<"convert-ttnn-to-emitpy", "::mlir::ModuleOp"> {
+  let summary = "Convert TTNN dialect to EmitPy dialect.";
+  let constructor = "createConvertTTNNToEmitPyPass()";
+  let dependentDialects = ["mlir::tt::emitpy::EmitPyDialect", "mlir::tt::ttnn::TTNNDialect"];
+  let options = [
+    // `target-module` is forwarded from the TTNN EmitPy pipeline options.
+    // Issue: https://github.com/tenstorrent/tt-mlir/issues/6746
+    Option<"targetModule", "target-module", "bool", /*default=*/"false",
+      "Tailor EmitPy conversion for Python module export target. When enabled, const-eval functions accept device as an explicit argument instead of opening it via a singleton.">
+  ];
+}
+
+def EmitPyConstEvalCaching : Pass<"emitpy-const-eval-caching", "::mlir::ModuleOp"> {
+  let summary = "Wrap complete consteval caching logic into the one if-guard.";
+  let description = [{
+    Post-conversion pass that walks functions containing a cache dictionary
+    and wraps const-eval calls (tagged with `emitpy.const_evaled`) and their
+    dict-set expressions in an `emitpy.if` guard:
+
+      if not dict:
+          dict["key"] = callee(inputs...)
+  }];
+  let constructor = "createEmitPyConstEvalCachingPass()";
+  let dependentDialects = ["mlir::tt::emitpy::EmitPyDialect"];
+}
+
+def EmitPyFormExpressions : Pass<"emitpy-form-expressions", "::mlir::ModuleOp"> {
+  let summary = "Form EmitPy expression ops from known patterns.";
+  let description = [{
+    Post-conversion pass that wraps known patterns of single-use EmitPy ops
+    into `emitpy.expression` blocks so the Python translator can emit them
+    inline, producing more compact and readable code.
+  }];
+  let constructor = "createEmitPyFormExpressionsPass()";
+  let dependentDialects = ["mlir::tt::emitpy::EmitPyDialect"];
+}
+
+def EmitPyNameVars : Pass<"emitpy-name-vars", "::mlir::ModuleOp"> {
+  let summary = "Pass to add suggested names for variables in EmitPy pipeline.";
+  let description = [{
+    This pass adds suggested names for operands based on operations on EmitPy IR.
+  }];
+  let constructor = "createEmitPyNameVarsPass()";
+  let dependentDialects = ["mlir::tt::emitpy::EmitPyDialect"];
+}
+
+def EmitPyLinkModules : Pass<"emitpy-link-modules", "::mlir::ModuleOp"> {
+  let summary = "Link ttcore.cpu_module and ttcore.device_module contents into top-level builtin.module";
+  let description = [{
+    This pass links the CPU and Device modules by moving all operations from both modules into
+    the root module. CPU-hoisted function declarations in the Device module are skipped (not moved),
+    and call sites are updated to call the actual function definitions from the CPU module.
+
+    Example:
+
+    Input:
+    module {
+      ttcore.cpu_module {
+        module {
+          func.func @cpu_hoisted_function() { ... }  // Definition of hoisted function
+        }
+      }
+      ttcore.device_module {
+        module {
+          emitpy.import "ttnn"
+          func.func private @cpu_hoisted_function()  // Stub declaration
+          func.func @device_function() {
+            call @cpu_hoisted_function()  // Call to hoisted function
+          }
+        }
+      }
+    }
+
+    Output:
+    module {
+      emitpy.import "ttnn"
+      func.func @cpu_hoisted_function() { ... }
+
+      func.func @device_function() {
+        call @cpu_hoisted_function()  // Call updated to the hoisted function definition
+      }
+    }
+  }];
+
+  let constructor = "createEmitPyLinkModulesPass()";
+  let dependentDialects = ["mlir::tt::emitpy::EmitPyDialect"];
+}
+
+def EmitPyAddImports : Pass<"emitpy-add-imports", "::mlir::ModuleOp"> {
+  let summary = "Add Python import statements to EmitPy IR.";
+  let description = [{
+    Adds Python import statements to the EmitPy IR:
+
+    1. Module-level imports (`import ttnn`, `import utils`, `import ttir_cpu`).
+       If FileOps exist (i.e., file splitting was performed), these are added
+       to each file scope. Otherwise, they are added to the module scope.
+       `import ttir_cpu` is only added to scopes that contain CPU-hoisted code.
+
+    2. Imported-declaration imports (`from <file> import <func>`). These are
+       generated from ImportedDeclaration func ops created by TTNNFileSplit,
+       and are placed in the same scope as the declaration they correspond to.
+
+    This pass runs after EmitPyLinkModules so that all modules have been merged
+    and the final file structure is known.
+
+    Note: the module-level imports are hardcoded. If the number of required
+    modules grows, consider a more scalable approach (e.g., scanning call
+    sites or having each conversion pass register its import requirements,
+    as well as ensuring that imports are deduplicated).
+  }];
+  let constructor = "createEmitPyAddImportsPass()";
+  let dependentDialects = ["mlir::tt::emitpy::EmitPyDialect"];
+}
+
+def ConvertTTKernelToEmitC : Pass<"convert-ttkernel-to-emitc", "::mlir::func::FuncOp"> {
+  let summary = "Convert TTKernel dialect to EmitC dialect.";
+  let dependentDialects = ["mlir::emitc::EmitCDialect", "mlir::func::FuncDialect",
+                           "mlir::tt::ttkernel::TTKernelDialect"];
+}
+
+def RemoveDeadEmitCExpressions : Pass<"remove-dead-emitc-expressions", "::mlir::func::FuncOp"> {
+  let summary = "Remove unused side-effect-free EmitC operations.";
+  let description = [{
+    Remove unused EmitC operations that implement CExpressionInterface or wrap
+    expression bodies in emitc.expression and report no side effects. Also
+    remove EmitC variables whose only uses are writes, together with the dead
+    assignments. This covers pure C expression fragments and write-only locals
+    that MLIR's generic DCE cannot see because EmitC models expression effects
+    through CExpressionInterface and variables carry memory effects.
+  }];
+  let constructor = "createRemoveDeadEmitCExpressionsPass()";
+  let dependentDialects = ["mlir::emitc::EmitCDialect"];
+}
+
+def ConvertSFPIToEmitC : Pass<"convert-sfpi-to-emitc", "::mlir::ModuleOp"> {
+  let summary = "Convert SFPI dialect to EmitC dialect using GCC RISC-V Tenstorrent builtins.";
+  let description = [{
+    This pass converts SFPI (SFPU Programming Interface) operations to EmitC
+    operations that emit calls to GCC RISC-V Tenstorrent builtin functions.
+
+    SFPI vector types (vector<4x8xf32>) are converted to __rvtt_vec_t and
+    operations are mapped to corresponding __builtin_rvtt_sfp* functions.
+  }];
+  let constructor = "createConvertSFPIToEmitCPass()";
+  let dependentDialects = ["mlir::emitc::EmitCDialect", "mlir::func::FuncDialect",
+                           "mlir::tt::sfpi::SFPIDialect"];
+}
+
+def ConvertTTIRToLinalg: Pass<"convert-ttir-to-linalg", "::mlir::ModuleOp"> {
+  let summary = "Convert TTIR dialect to Linalg dialect.";
+  let description = [{
+    Conversion pass to convert TTIR ops with defined conversion pattern into linalg ops, with broadcast and collapse tensor ops as needed.
+    Example:
+    Input:
+      func.func @add_with_broadcast(
+        %arg0: tensor<32x32xf32>,
+        %arg1: tensor<32x1xf32>,
+        %arg2: tensor<32x32xf32>
+      ) -> tensor<32x32xf32> {
+        %1 = "ttir.add"(%arg0, %arg1, %arg2) : (tensor<32x32xf32>, tensor<32x1xf32>, tensor<32x32xf32>) -> tensor<32x32xf32>
+        return %1 : tensor<32x32xf32>
+      }
+    Output:
+      func.func @add_with_broadcast(
+        %arg0: tensor<32x32xf32>,
+        %arg1: tensor<32x1xf32>,
+        %arg2: tensor<32x32xf32>
+      ) -> tensor<32x32xf32> {
+        %collapsed = tensor.collapse_shape %arg1 [[0, 1]] : tensor<32x1xf32> into tensor<32xf32>
+        %0 = ttir.empty() : tensor<32x32xf32>
+        %broadcasted = linalg.broadcast ins(%collapsed : tensor<32xf32>) outs(%0 : tensor<32x32xf32>) dimensions = [1]
+        %1 = linalg.add ins(%arg0, %broadcasted : tensor<32x32xf32>, tensor<32x32xf32>) outs(%arg2 : tensor<32x32xf32>) -> tensor<32x32xf32>
+        return %1 : tensor<32x32xf32>
+    }
+  }];
+  let constructor = "createConvertTTIRToLinalgPass()";
+  let dependentDialects = ["mlir::tt::ttir::TTIRDialect", "mlir::linalg::LinalgDialect", "mlir::tosa::TosaDialect", "mlir::scf::SCFDialect"];
+}
+
+def ConvertTTNNToTTIR : Pass<"convert-ttnn-to-ttir", "::mlir::ModuleOp"> {
+let summary = "Convert TTNN dialect to TTIR dialect.";
+  let constructor = "createConvertTTNNToTTIRPass()";
+  let dependentDialects = ["mlir::tt::ttnn::TTNNDialect", "mlir::tt::ttir::TTIRDialect"];
+}
+
+def ConvertD2MToTTNN: Pass<"convert-d2m-to-ttnn", "::mlir::ModuleOp">{
+  let summary = "Conversion to exit D2M flow into TTNN";
+  let description = [{
+    Conversion pass to convert from D2M to TTNN by constructing a TTNN Generic op using the D2M GenericOp.
+    The input into the D2M GenericOp comes from a `ttir.ttnn_metal_layout_cast`, and the output also goes
+    through a cast op. This pass also lifts any d2m.empty with attached ttnn_layout back into a ttnn.empty.
+    The current version does not support intermediate tensor allocations.
+
+    Example:
+    Input IR:
+      %ttnn_input_l1 = "ttnn.to_memory_config"(%arg0) : (tensor<32x32xf32, #dram_layout>) -> tensor<32x32xf32, #l1_layout>
+      %ttnn_output_l1 = ttir.empty() : tensor<32x32xf32, #l1_layout>
+      %metal_input_l1 = ttir.ttnn_metal_layout_cast %ttnn_input_l1 : tensor<32x32xf32, #l1_layout> -> memref<1x1x1x1x!ttcore.tile<32x32, f32>, #ttcore.shard<4096x4096>, #ttcore.memory_space<l1>>
+      %metal_output_l1 = ttir.ttnn_metal_layout_cast %ttnn_output_l1 : tensor<32x32xf32, #l1_layout> -> memref<1x1x1x1x!ttcore.tile<32x32, f32>, #ttcore.shard<4096x4096>, #ttcore.memory_space<l1>>
+      d2m.generic {block_factors = [1, 1], grid = #ttcore.grid<1x1>, indexing_maps = [], iterator_types = [], threads = [#d2m.thread<datamovement, @read_kernel>, #d2m.thread<datamovement, @write_kernel>, #d2m.thread<compute, @compute_kernel0>]}
+          ins(%metal_input_l1 : memref<1x1x1x1x!ttcore.tile<32x32, f32>, #ttcore.shard<4096x4096>, #ttcore.memory_space<l1>>)
+          outs(%metal_output_l1 : memref<1x1x1x1x!ttcore.tile<32x32, f32>, #ttcore.shard<4096x4096>, #ttcore.memory_space<l1>>)
+      %output_l1 = ttir.ttnn_metal_layout_cast
+
+    Output IR (post canonicalization):
+      %1 = "ttnn.to_memory_config"(%arg0) : (tensor<32x32xf32, #ttnn_layout>) -> tensor<32x32xf32, #ttnn_layout1>
+      %2 = "ttnn.empty"(%0) <{layout = #ttnn.layout<tile>}> : (!ttnn.device) -> tensor<32x32xf32, #ttnn_layout1>
+      "ttnn.generic"(%1, %2) ...
+  }];
+  let constructor = "createConvertD2MToTTNNPass()";
+  let dependentDialects = ["mlir::tt::ttir::TTIRDialect", "mlir::tt::ttnn::TTNNDialect"];
+  let options = [
+    Option<"mathFidelity", "math-fidelity", "mlir::tt::ttmetal::MathFidelity",
+           /*default=*/"mlir::tt::ttmetal::MathFidelity::HiFi4",
+           "Set the math fidelity for ttnn.generic op",
+           [{::llvm::cl::values(
+             clEnumValN(mlir::tt::ttmetal::MathFidelity::LoFi, "LoFi", "LoFi"),
+             clEnumValN(mlir::tt::ttmetal::MathFidelity::HiFi2, "HiFi2", "HiFi2"),
+             clEnumValN(mlir::tt::ttmetal::MathFidelity::HiFi3, "HiFi3", "HiFi3"),
+             clEnumValN(mlir::tt::ttmetal::MathFidelity::HiFi4, "HiFi4", "HiFi4")
+           )}]>
+  ];
+}
+
+
+#endif // TTMLIR_CONVERSION_PASSES

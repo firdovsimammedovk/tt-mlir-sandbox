@@ -1,0 +1,428 @@
+// SPDX-FileCopyrightText: (c) 2024 Tenstorrent AI ULC
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#include "ttmlir/Dialect/TTNN/Utils/Utils.h"
+
+#include "ttmlir/Asserts.h"
+#include "ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h"
+#include "ttmlir/Dialect/TTCore/IR/Utils.h"
+#include "ttmlir/Dialect/TTNN/IR/TTNNOpsAttrs.h"
+#include "ttmlir/Dialect/TTNN/Types/Types.h"
+#include "ttmlir/Utils.h"
+
+#include "mlir/Dialect/Quant/IR/QuantTypes.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/Location.h"
+#include "mlir/IR/Operation.h"
+#include "mlir/IR/Value.h"
+#include "mlir/Support/LLVM.h"
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/Support/Casting.h"
+
+#include <cstdint>
+#include <optional>
+
+namespace mlir::tt::ttnn::utils {
+
+float getTensorL1UsageCap(Operation *op, float defaultValue) {
+  // Walk up to find the module operation that has the attribute
+  ModuleOp moduleOp = op->getParentOfType<ModuleOp>();
+
+  if (moduleOp) {
+    if (auto attr =
+            moduleOp->getAttrOfType<FloatAttr>(g_TensorL1UsageCapAttrName)) {
+      return attr.getValueAsDouble();
+    }
+  }
+
+  return defaultValue;
+}
+
+uint64_t getReservedL1Usage(Operation *op) {
+  ModuleOp moduleOp = op->getParentOfType<ModuleOp>();
+
+  if (moduleOp) {
+    if (auto attr =
+            moduleOp->getAttrOfType<IntegerAttr>(g_L1ConstEvalUsageAttrName)) {
+      return attr.getValue().getZExtValue();
+    }
+  }
+
+  return 0;
+}
+
+uint64_t getUsableL1PerCore(Operation *op) {
+  const float cap = getTensorL1UsageCap(op);
+
+  ttcore::ChipDescAttr chipDesc = ttcore::getOpChipDescAttr(op);
+  const uint64_t capped =
+      static_cast<uint64_t>(cap * chipDesc.getUsableL1Size());
+  const uint64_t reserved = getReservedL1Usage(op);
+  TT_assertv(reserved <= capped, "Reserved L1 usage exceeds capped value");
+
+  return capped - reserved;
+}
+
+bool isTensorOnDevice(::mlir::RankedTensorType tensorType) {
+  auto ttnnLayoutAttr =
+      ::mlir::cast<ttnn::TTNNLayoutAttr>(tensorType.getEncoding());
+  bool isOnDevice =
+      ttnnLayoutAttr.getBufferType() != ttnn::BufferType::SystemMemory;
+  return isOnDevice;
+}
+
+// Map ttcore::MemorySpace to TTNN::BufferType
+//
+mlir::tt::ttnn::BufferType
+toTTNNBufferType(const mlir::tt::ttcore::MemorySpace memorySpace) {
+  switch (memorySpace) {
+  case mlir::tt::ttcore::MemorySpace::System:
+  case mlir::tt::ttcore::MemorySpace::SystemMMIO:
+    return BufferType::SystemMemory;
+  case mlir::tt::ttcore::MemorySpace::DeviceDRAM:
+    return BufferType::DRAM;
+  case mlir::tt::ttcore::MemorySpace::DeviceL1:
+    return BufferType::L1;
+  case mlir::tt::ttcore::MemorySpace::RegisterDst:
+    llvm_unreachable("MemorySpace::RegisterDst not supported");
+  }
+
+  llvm_unreachable("Unknown MemorySpace");
+}
+
+mlir::tt::ttcore::MemorySpace
+toTTMemorySpace(const mlir::tt::ttnn::BufferType bufferType) {
+  switch (bufferType) {
+  case ttnn::BufferType::SystemMemory:
+    return mlir::tt::ttcore::MemorySpace::System;
+  case ttnn::BufferType::DRAM:
+    return mlir::tt::ttcore::MemorySpace::DeviceDRAM;
+  case ttnn::BufferType::L1:
+    return mlir::tt::ttcore::MemorySpace::DeviceL1;
+  case ttnn::BufferType::L1Small:
+    assert(false && "BufferType::L1Small not supported");
+  case ttnn::BufferType::Trace:
+    assert(false && "BufferType::Trace not supported");
+  }
+
+  llvm_unreachable("Unknown MemorySpace");
+}
+
+RankedTensorType
+RankedTensorTypeFactory::create(RankedTensorType tensorType,
+                                ttnn::TTNNLayoutAttr encoding) {
+  return RankedTensorType::get(tensorType.getShape(),
+                               tensorType.getElementType(), encoding);
+}
+
+RankedTensorType RankedTensorTypeFactory::create(RankedTensorType tensorType,
+                                                 Type memrefElementType) {
+  TTNNLayoutAttr newEncoding =
+      TTNNLayoutAttr::Builder(tensorType).setElementType(memrefElementType);
+  Type newElementType = memrefElementType;
+  if (ttcore::TileType tileType = dyn_cast<ttcore::TileType>(newElementType)) {
+    newElementType = tileType.getElementType();
+  }
+  return RankedTensorType::get(tensorType.getShape(), newElementType,
+                               newEncoding);
+}
+
+RankedTensorType RankedTensorTypeFactory::create(RankedTensorType tensorType,
+                                                 ttnn::BufferType bufferType) {
+  TTNNLayoutAttr newEncoding =
+      TTNNLayoutAttr::Builder(tensorType).setBufferType(bufferType).build();
+  return create(tensorType, newEncoding);
+}
+
+RankedTensorType
+RankedTensorTypeFactory::create(RankedTensorType tensorType,
+                                ttnn::TensorMemoryLayout memoryLayout,
+                                mlir::tt::ttcore::DeviceAttr deviceAttr) {
+  TTNNLayoutAttr newEncoding = TTNNLayoutAttr::Builder(tensorType)
+                                   .setMemoryLayout(memoryLayout)
+                                   .buildWithCanonicalCorePlacement(deviceAttr);
+  return create(tensorType, newEncoding);
+}
+
+RankedTensorType RankedTensorTypeFactory::create(RankedTensorType tensorType,
+                                                 Layout layout) {
+  // If the tensor is quantized, only update the layout in the encoding.
+  if (auto quantType =
+          dyn_cast<mlir::quant::QuantizedType>(tensorType.getElementType())) {
+    ttcore::DataType dataType =
+        mlir::tt::ttcore::elementTypeToDataType(quantType);
+    Type memrefElementType =
+        utils::getElementType(tensorType.getContext(), layout, dataType);
+    TTNNLayoutAttr newEncoding =
+        TTNNLayoutAttr::Builder(tensorType).setElementType(memrefElementType);
+    return RankedTensorType::get(tensorType.getShape(), quantType, newEncoding);
+  }
+  ttcore::DataType dataType =
+      mlir::tt::ttcore::elementTypeToDataType(tensorType.getElementType());
+  Type memrefElementType =
+      utils::getElementType(tensorType.getContext(), layout, dataType);
+  return create(tensorType, memrefElementType);
+}
+
+RankedTensorType
+RankedTensorTypeFactory::create(RankedTensorType tensorType,
+                                ArrayRef<int64_t> gridShape,
+                                ttcore::DeviceAttr deviceAttr) {
+  TTNNLayoutAttr newEncoding = TTNNLayoutAttr::Builder(tensorType)
+                                   .setGridShape(gridShape)
+                                   .buildWithCanonicalCorePlacement(deviceAttr);
+  return create(tensorType, newEncoding);
+}
+
+RankedTensorType RankedTensorTypeFactory::create(RankedTensorType tensorType,
+                                                 ttcore::DataType dataType) {
+  TTNNLayoutAttr oldEncoding = getLayoutAttrFromTensor(tensorType);
+  Type nmemrefElementType = utils::getElementType(
+      tensorType.getContext(), oldEncoding.getLayout(), dataType);
+  return create(tensorType, nmemrefElementType);
+}
+
+RankedTensorType
+RankedTensorTypeFactory::create(RankedTensorType tensorType,
+                                ArrayRef<int64_t> tensorShape) {
+  TTNNLayoutAttr oldEncoding = getLayoutAttrFromTensor(tensorType);
+  TTNNLayoutAttr newEncoding =
+      TTNNLayoutAttr::Builder(oldEncoding, tensorShape);
+  return RankedTensorType::get(tensorShape, tensorType.getElementType(),
+                               newEncoding);
+}
+
+// Helper method to get the buffer type from the tensor layout encoding.
+BufferType getBufferTypeFromTensor(RankedTensorType tensorType) {
+  TTNNLayoutAttr layoutAttr = getLayoutAttrFromTensor(tensorType);
+  return layoutAttr.getBufferType();
+}
+
+// Return the L1 memory usage of the output tensor of the given op.
+// Used within L1 interleaved policies and temporarily within L1 Interleaved
+// Fallback Analysis.
+//
+uint64_t getOpOutputL1Usage(TTNNLayoutAttr opLayout) {
+  // In case the opLayout is not in L1 memory space, L1 memory usage is 0.
+  //
+  if (!opLayout.hasL1BufferType()) {
+    return 0;
+  }
+
+  return opLayout.getShardSizeInBytes();
+}
+
+uint64_t getPerCoreL1Usage(TTNNLayoutAttr layout, uint64_t numCores) {
+  if (!layout.hasL1BufferType()) {
+    return 0;
+  }
+  uint64_t totalSize = layout.getShardSizeInBytes();
+  auto ml = layout.getMemLayout();
+  if (ml && isShardedMemoryLayout(ml.getValue())) {
+    return totalSize;
+  }
+  // L1 interleaved: data is distributed across all device cores.
+  return numCores > 0 ? totalSize / numCores : totalSize;
+}
+
+// Helper method to get the tensor layout attribute from the value.
+TTNNLayoutAttr getLayoutAttrFromTensor(RankedTensorType tensorType) {
+  return mlir::cast<TTNNLayoutAttr>(tensorType.getEncoding());
+}
+
+// Helper method to get the element type for the given tensor layout and data.
+Type getElementType(MLIRContext *context, Layout tensorLayout,
+                    ttcore::DataType dataType) {
+  return tensorLayout == Layout::Tile
+             ? ttcore::TileType::get(
+                   context, {ttnn::TILE_HEIGHT, ttnn::TILE_WIDTH}, dataType)
+             : mlir::tt::ttcore::dataTypeToElementType(context, dataType);
+}
+
+// Save the IR to a file for debugging.
+void irToFile(mlir::Operation *op, std::string filename) {
+  OpPrintingFlags printFlags;
+  printFlags = printFlags.enableDebugInfo();
+
+  std::error_code ec;
+  llvm::raw_fd_ostream file(filename, ec);
+  if (ec) {
+    llvm::errs() << "Error opening file: " << ec.message() << "\n";
+    return;
+  }
+  op->print(file, printFlags);
+}
+
+std::string getOpLocName(Operation *op) {
+  if (NameLoc loc = llvm::dyn_cast<NameLoc>(op->getLoc())) {
+    return loc.getName().str();
+  }
+  return "";
+}
+
+llvm::SmallVector<int64_t> getTilePaddedShape(llvm::ArrayRef<int64_t> shape) {
+  llvm::SmallVector<int64_t, 4> tiledShape(shape);
+  const size_t rank = shape.size();
+  if (rank > 0) {
+    tiledShape[shape.size() - 1] =
+        ttmlir::utils::alignUp<int64_t>(shape[shape.size() - 1], TILE_WIDTH);
+  }
+  if (rank > 1) {
+    tiledShape[shape.size() - 2] =
+        ttmlir::utils::alignUp<int64_t>(shape[shape.size() - 2], TILE_HEIGHT);
+  }
+  return tiledShape;
+}
+
+std::vector<TTNNLayoutAttr> extractInputLayouts(Operation *op) {
+  std::vector<TTNNLayoutAttr> inputLayouts;
+
+  for (auto operand : op->getOperands()) {
+    // Extract layout from tensor type.
+    if (auto tensorType = mlir::dyn_cast<RankedTensorType>(operand.getType())) {
+      if (auto layout =
+              mlir::dyn_cast<TTNNLayoutAttr>(tensorType.getEncoding())) {
+        inputLayouts.push_back(layout);
+      }
+    }
+  }
+
+  return inputLayouts;
+}
+
+std::optional<NDShardSpecAttr>
+createNDShardSpecIfNeeded(TTNNNDLayoutAttr layoutAttr) {
+  std::optional<NDShardSpecAttr> ndShardSpecAttr = std::nullopt;
+  if (layoutAttr && layoutAttr.isSharded()) {
+    ndShardSpecAttr = NDShardSpecAttr::get(layoutAttr);
+  }
+  return ndShardSpecAttr;
+}
+
+bool isTTNNHoistGenericViaD2MOp(mlir::Operation *op) {
+  return op->hasAttr(g_TTNNHoistGenericViaD2MAttrName);
+}
+
+std::set<mlir::StringRef> getAllTTNNDialectOps(MLIRContext *context) {
+  std::set<mlir::StringRef> opNames;
+  TTNNDialect *dialect = context->getLoadedDialect<TTNNDialect>();
+
+  // We should use getRegisteredOperationsByDialect but it has a bug in MLIR.
+  // See https://github.com/llvm/llvm-project/issues/146940.
+  for (mlir::RegisteredOperationName opName :
+       context->getRegisteredOperations()) {
+    if (opName.getDialectNamespace() != dialect->getNamespace()) {
+      continue;
+    }
+    opNames.insert(opName.getStringRef());
+  }
+  return opNames;
+}
+
+// Helper function to get TTNNLayoutAttr from operation's first result
+static std::optional<TTNNLayoutAttr> getTTNNLayoutAttrFromOp(Operation *op) {
+  if (op->getNumResults() == 0) {
+    return std::nullopt;
+  }
+
+  auto resultType =
+      mlir::dyn_cast<mlir::RankedTensorType>(op->getResult(0).getType());
+  if (!resultType) {
+    return std::nullopt;
+  }
+
+  auto encoding = resultType.getEncoding();
+  if (!encoding) {
+    return std::nullopt;
+  }
+
+  if (auto ttnnLayout = mlir::dyn_cast<TTNNLayoutAttr>(encoding)) {
+    return ttnnLayout;
+  }
+
+  return std::nullopt;
+}
+
+bool producesTTNNLayoutEncoding(Operation *op) {
+  auto ttnnLayout = getTTNNLayoutAttrFromOp(op);
+  return ttnnLayout.has_value();
+}
+
+bool producesDRAMLayout(Operation *op) {
+  auto ttnnLayout = getTTNNLayoutAttrFromOp(op);
+  return ttnnLayout && ttnnLayout->hasDRAMBufferType();
+}
+
+bool producesL1Layout(Operation *op) {
+  auto ttnnLayout = getTTNNLayoutAttrFromOp(op);
+  return ttnnLayout && ttnnLayout->hasL1BufferType();
+}
+
+bool producesSystemMemoryLayout(Operation *op) {
+  auto ttnnLayout = getTTNNLayoutAttrFromOp(op);
+  return ttnnLayout && ttnnLayout->isSystemBufferType();
+}
+
+bool producesTiledTensorLayout(Operation *op) {
+  auto ttnnLayout = getTTNNLayoutAttrFromOp(op);
+  return ttnnLayout && ttnnLayout->isTiled();
+}
+
+bool producesShardedL1Layout(Operation *op) {
+  auto ttnnLayout = getTTNNLayoutAttrFromOp(op);
+  return ttnnLayout && ttnnLayout->hasShardedL1TensorMemoryLayout();
+}
+
+bool hasFirstOperandInDRAM(Operation *op) {
+  if (op->getNumOperands() == 0) {
+    return false;
+  }
+
+  auto firstOperand = op->getOperand(0);
+  auto tensorType =
+      mlir::dyn_cast<mlir::RankedTensorType>(firstOperand.getType());
+
+  if (auto ttnnLayout =
+          mlir::dyn_cast_if_present<TTNNLayoutAttr>(tensorType.getEncoding())) {
+    return ttnnLayout.hasDRAMBufferType();
+  }
+
+  return false;
+}
+
+mlir::RankedTensorType getTraceIdType(MLIRContext *ctx) {
+  return ::mlir::RankedTensorType::get(
+      /*shape=*/{},
+      ::mlir::IntegerType::get(ctx, /*width=*/32, IntegerType::Unsigned),
+      ttnn::TraceIdAttr::get(ctx));
+}
+
+UnaryWithParamAttr getActivationAttr(MLIRContext *ctx,
+                                     std::optional<StringRef> activation) {
+  if (!activation.has_value() || activation->empty()) {
+    return nullptr;
+  }
+  auto unaryOpType = symbolizeUnaryOpType(*activation);
+  if (!unaryOpType.has_value()) {
+    return nullptr;
+  }
+  return UnaryWithParamAttr::get(ctx, *unaryOpType,
+                                 llvm::ArrayRef<FloatAttr>{});
+}
+
+std::pair<int64_t, int64_t> getPhysicalGridDimensions(TTNNLayoutAttr layout) {
+  CoreRangeSetAttr coreRangeSet = layout.getCoreRangeSet();
+  assert(coreRangeSet &&
+         "getPhysicalGridDimensions requires a sharded layout with a CRS");
+
+  int64_t maxX = 0;
+  int64_t maxY = 0;
+  for (CoreRangeAttr range : coreRangeSet.getCoreRanges()) {
+    maxX = std::max(maxX, static_cast<int64_t>(range.getEndCoord().getX() + 1));
+    maxY = std::max(maxY, static_cast<int64_t>(range.getEndCoord().getY() + 1));
+  }
+  return {maxX, maxY};
+}
+
+} // namespace mlir::tt::ttnn::utils

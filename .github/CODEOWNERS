@@ -1,0 +1,270 @@
+# Misc
+/env/ @nsmithtt @vwellsTT
+/env/patches/shardy* @tenstorrent/forge-developers-mlir-stablehlo
+*.fbs @nsmithtt
+LICENSE @nsmithtt
+
+# CI
+/.github/ @tenstorrent/forge-developers-mlir-devops
+/.github/CODEOWNERS @vmilosevic @nsmithtt @sdjordjevicTT @tt-mpantic
+
+# Build
+*.cmake @tenstorrent/forge-developers-mlir-build
+*.txt @tenstorrent/forge-developers-mlir-build
+
+# Docs
+*.md @nsmithtt @sdjordjevicTT
+/docs/ @nsmithtt @sdjordjevicTT
+/docs/src/specs/ttnn-optimizer.md @rpavlovicTT @odjuricicTT
+
+# Claude Skills
+/.claude/skills/ @nsmithtt @sdjordjevicTT @svuckovicTT
+
+# StableHLO Dialect
+include/ttmlir/Dialect/StableHLO @tenstorrent/forge-developers-mlir-stablehlo
+lib/Dialect/StableHLO @tenstorrent/forge-developers-mlir-stablehlo
+test/ttmlir/Dialect/StableHLO @tenstorrent/forge-developers-mlir-stablehlo
+
+# StableHLO Conversion
+/include/ttmlir/Conversion/ArithToStableHLO/ @tenstorrent/forge-developers-mlir-stablehlo
+/include/ttmlir/Conversion/StableHLOToTTIR/ @tenstorrent/forge-developers-mlir-stablehlo
+/lib/Conversion/StableHLOToTTIR/ @tenstorrent/forge-developers-mlir-stablehlo
+/test/ttmlir/Conversion/ArithToStableHLO/ @tenstorrent/forge-developers-mlir-stablehlo
+/test/ttmlir/Conversion/StableHLOToTTIR/ @tenstorrent/forge-developers-mlir-stablehlo
+/test/ttmlir/Silicon/StableHLO/ @tenstorrent/forge-developers-mlir-stablehlo
+
+# Linalg Conversion
+/include/ttmlir/Conversion/TTIRToLinalg/ @tenstorrent/forge-developers-mlir-core
+/lib/Conversion/TTIRToLinalg/ @tenstorrent/forge-developers-mlir-core
+/test/ttmlir/Conversion/TTIRToLinalg/ @tenstorrent/forge-developers-mlir-core
+/test/ttmlir/Conversion/LinalgToLLVM/ @tenstorrent/forge-developers-mlir-core
+
+# Tosa Conversion
+/include/ttmlir/Conversion/TosaToTTIR/ @tenstorrent/forge-developers-mlir-tosa
+/lib/Conversion/TosaToTTIR/ @tenstorrent/forge-developers-mlir-tosa
+/test/ttmlir/Conversion/TosaToTTIR/ @tenstorrent/forge-developers-mlir-tosa
+
+# TTNN Conversions
+/include/ttmlir/Conversion/TTIRToTTIRDecomposition/ @tenstorrent/forge-developers-mlir-core
+/include/ttmlir/Conversion/TTIRToTTNN/ @tenstorrent/forge-developers-mlir-core
+/include/ttmlir/Conversion/TTNNToEmitC/ @tenstorrent/forge-developers-mlir-core
+/include/ttmlir/Conversion/TTNNToEmitPy/ @tenstorrent/forge-developers-mlir-core
+/lib/Conversion/TTIRToTTIRDecomposition/ @tenstorrent/forge-developers-mlir-core
+/lib/Conversion/TTIRToTTNN/ @tenstorrent/forge-developers-mlir-core
+/lib/Conversion/TTNNToEmitC/ @tenstorrent/forge-developers-mlir-core
+/lib/Conversion/TTNNToEmitPy/ @tenstorrent/forge-developers-mlir-core
+/test/ttmlir/Conversion/TTIRToTTIRDecomposition/ @tenstorrent/forge-developers-mlir-core
+/test/ttmlir/Conversion/TTIRToTTNN/ @tenstorrent/forge-developers-mlir-core
+/test/ttmlir/Conversion/TTNNToEmitC/ @tenstorrent/forge-developers-mlir-core
+/test/ttmlir/Conversion/TTNNToEmitPy/ @tenstorrent/forge-developers-mlir-core
+/test/ttmlir/EmitC/ @tenstorrent/forge-developers-mlir-core
+/test/ttmlir/EmitPy/ @tenstorrent/forge-developers-mlir-core
+/test/unittests/TTNNToEmitC/ @tenstorrent/forge-developers-mlir-core
+
+# TTIR Dialect
+/include/ttmlir/Dialect/TTIR/ @tenstorrent/forge-developers-mlir-core @mrakitaTT
+/lib/Dialect/TTIR/ @tenstorrent/forge-developers-mlir-core @mrakitaTT
+/test/ttmlir/Dialect/TTIR/ @tenstorrent/forge-developers-mlir-core @mrakitaTT
+
+# D2M Dialect (general)
+/include/ttmlir/Conversion/D2M* @tenstorrent/forge-developers-mlir-d2m
+/include/ttmlir/Conversion/*D2M @tenstorrent/forge-developers-mlir-d2m
+/include/ttmlir/Dialect/D2M/ @tenstorrent/forge-developers-mlir-d2m
+/lib/Conversion/D2M* @tenstorrent/forge-developers-mlir-d2m
+/lib/Conversion/*D2M @tenstorrent/forge-developers-mlir-d2m
+/lib/Dialect/D2M/ @tenstorrent/forge-developers-mlir-d2m
+/test/ttmlir/Conversion/D2M* @tenstorrent/forge-developers-mlir-d2m
+/test/ttmlir/Conversion/*D2M @tenstorrent/forge-developers-mlir-d2m
+/test/ttmlir/Dialect/D2M/ @tenstorrent/forge-developers-mlir-d2m
+/test/python/golden/d2m/ @tenstorrent/forge-developers-mlir-d2m
+
+# D2M Allocator
+/lib/Dialect/D2M/Transforms/Allocate.cpp @anuragsingh-tt @vwellsTT
+/lib/Dialect/D2M/Transforms/HoistCBAllocs.cpp @anuragsingh-tt @vwellsTT
+/include/ttmlir/Dialect/D2M/Analysis/Allocation/ @anuragsingh-tt @vwellsTT
+/test/ttmlir/Dialect/D2M/allocate/ @anuragsingh-tt @vwellsTT
+/test/ttmlir/Dialect/D2M/Transforms/hoist_cb_allocs.mlir @anuragsingh-tt @vwellsTT
+
+# D2M Compute Lowering and Fusion
+/lib/Dialect/D2M/Transforms/ElementwiseFusion.cpp @jdesousaTT @ckaravasilisTT @mbagherbeikTT @sgholamiTT @dlokeTT
+/lib/Dialect/D2M/Transforms/InsertScratchBuffers.cpp @jdesousaTT @ckaravasilisTT @mbagherbeikTT @sgholamiTT @dlokeTT
+/lib/Dialect/D2M/Transforms/GenericTileComputeLoops.cpp @jdesousaTT @ckaravasilisTT @mbagherbeikTT @sgholamiTT @dlokeTT
+/lib/Dialect/D2M/Transforms/OpScheduler.cpp @jdesousaTT @ckaravasilisTT @mbagherbeikTT @sgholamiTT @dlokeTT
+/lib/Dialect/D2M/Transforms/InsertSpillAndScratch.cpp @jdesousaTT @ckaravasilisTT @mbagherbeikTT @sgholamiTT @dlokeTT
+/lib/Dialect/D2M/Transforms/LowerScratchAllocate.cpp @jdesousaTT @ckaravasilisTT @mbagherbeikTT @sgholamiTT @dlokeTT
+/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess.cpp @jdesousaTT @ckaravasilisTT @mbagherbeikTT @sgholamiTT @dlokeTT
+/lib/Dialect/D2M/Transforms/InsertTileMatmulBlock.cpp @jdesousaTT @ckaravasilisTT @mbagherbeikTT @sgholamiTT @dlokeTT
+/lib/Dialect/D2M/Transforms/SFPUTileLoopFission.cpp @jdesousaTT @ckaravasilisTT @mbagherbeikTT @sgholamiTT @dlokeTT
+/lib/Dialect/D2M/Transforms/LinalgToAffine.cpp @jdesousaTT @ckaravasilisTT @mbagherbeikTT @sgholamiTT @dlokeTT
+/test/ttmlir/Dialect/D2M/Transforms/eltwise_fusion*.mlir @jdesousaTT @ckaravasilisTT @mbagherbeikTT @sgholamiTT @dlokeTT
+/test/ttmlir/Dialect/D2M/Transforms/insert_spill_and_scratch.mlir @jdesousaTT @ckaravasilisTT @mbagherbeikTT @sgholamiTT @dlokeTT
+/test/ttmlir/Dialect/D2M/Transforms/op_scheduler.mlir @jdesousaTT @ckaravasilisTT @mbagherbeikTT @sgholamiTT @dlokeTT
+/test/ttmlir/Dialect/D2M/Transforms/insert_dst_register_access*.mlir @jdesousaTT @ckaravasilisTT @mbagherbeikTT @sgholamiTT @dlokeTT
+/test/ttmlir/Dialect/D2M/Transforms/generic_tile_compute_loops.mlir @jdesousaTT @ckaravasilisTT @mbagherbeikTT @sgholamiTT @dlokeTT
+/test/ttmlir/Dialect/D2M/Transforms/linalg_to_affine.mlir @jdesousaTT @ckaravasilisTT @mbagherbeikTT @sgholamiTT @dlokeTT
+/test/ttmlir/Dialect/D2M/Transforms/control_dst_section.mlir @jdesousaTT @ckaravasilisTT @mbagherbeikTT @sgholamiTT @dlokeTT
+/test/ttmlir/Dialect/D2M/generic/insert_scratch_buffers.mlir @jdesousaTT @ckaravasilisTT @mbagherbeikTT @sgholamiTT @dlokeTT
+/test/ttmlir/Dialect/D2M/generic/eltwise_fusion_e2e.mlir @jdesousaTT @ckaravasilisTT @mbagherbeikTT @sgholamiTT @dlokeTT
+
+# D2M Grid Selection
+/lib/Dialect/D2M/Transforms/GridSelection.cpp @vwellsTT
+/lib/Dialect/D2M/Utils/GridSelectionUtils.cpp @vwellsTT
+/include/ttmlir/Dialect/D2M/Utils/GridSelectionUtils.h @vwellsTT
+/test/ttmlir/Dialect/D2M/Transforms/grid_selection*.mlir @vwellsTT
+
+# D2M View and Layout Handling
+/lib/Dialect/D2M/Transforms/LowerToLayout.cpp @vwellsTT
+/lib/Dialect/D2M/Transforms/MaterializeViewReturns.cpp @vwellsTT
+/test/ttmlir/Dialect/D2M/Transforms/lower_to_layout*.mlir @vwellsTT
+/test/ttmlir/Dialect/D2M/Transforms/view_layout*.mlir @vwellsTT
+/test/ttmlir/Dialect/D2M/materialize_view_returns.mlir @vwellsTT
+
+# D2M Thread Splitting and DMA Lowering
+/lib/Dialect/D2M/Transforms/SplitUnifiedThread.cpp @vtangTT @sohaibnadeemTT @arminaleTT
+/lib/Dialect/D2M/Transforms/LowerLoadStoreOpsToDMA.cpp @vtangTT @sohaibnadeemTT @arminaleTT
+/lib/Dialect/D2M/Transforms/PreallocateMcastSemaphores.cpp @vtangTT @sohaibnadeemTT @arminaleTT
+/lib/Dialect/D2M/Transforms/LowerDMAToFullyIndexedForm.cpp @vtangTT @sohaibnadeemTT @arminaleTT
+/lib/Dialect/D2M/Transforms/ScheduleDMA.cpp @vtangTT @sohaibnadeemTT @arminaleTT
+/lib/Dialect/D2M/Transforms/DMAOptimizations.cpp @vtangTT @sohaibnadeemTT @arminaleTT
+/lib/Dialect/D2M/Transforms/LowerMulticastLoads.cpp @vtangTT @sohaibnadeemTT @arminaleTT
+/lib/Dialect/D2M/Transforms/ExpandDMAReadCompositeView.cpp @vtangTT @sohaibnadeemTT @arminaleTT
+/test/ttmlir/Dialect/D2M/Transforms/split_unified_thread*.mlir @vtangTT @sohaibnadeemTT @arminaleTT
+/test/ttmlir/Dialect/D2M/Transforms/schedule_dma.mlir @vtangTT @sohaibnadeemTT @arminaleTT
+/test/ttmlir/Dialect/D2M/Transforms/preallocate_mcast_semaphores.mlir @vtangTT @sohaibnadeemTT @arminaleTT
+/test/ttmlir/Dialect/D2M/Transforms/lower_load_store_ops*.mlir @vtangTT @sohaibnadeemTT @arminaleTT
+/test/ttmlir/Dialect/D2M/Transforms/lower_dma_to_fully_indexed_form.mlir @vtangTT @sohaibnadeemTT @arminaleTT
+/test/ttmlir/Dialect/D2M/Transforms/dma_optimizations.mlir @vtangTT @sohaibnadeemTT @arminaleTT
+/test/ttmlir/Dialect/D2M/Transforms/lower_multicast_loads.mlir @vtangTT @sohaibnadeemTT @arminaleTT
+/test/ttmlir/Dialect/D2M/Transforms/expand_dma_read_composite_view.mlir @vtangTT @sohaibnadeemTT @arminaleTT
+
+# D2M Runtime (D2MToTTNN, D2MToTTMetal, D2MToTTKernel)
+/lib/Dialect/D2M/Transforms/NormalizeThreadArgs.cpp @vtangTT @arminaleTT @hkwonTT @sohaibnadeemTT
+/lib/Conversion/D2MToTTNN/ @vtangTT @arminaleTT @hkwonTT @sohaibnadeemTT
+/lib/Conversion/D2MToTTMetal/ @vtangTT @arminaleTT @hkwonTT @sohaibnadeemTT
+/lib/Conversion/D2MToTTKernel/ @vtangTT @arminaleTT @hkwonTT @sohaibnadeemTT
+/include/ttmlir/Conversion/D2MToTTKernel/ @vtangTT @arminaleTT @hkwonTT @sohaibnadeemTT
+/test/ttmlir/Conversion/D2MToTTKernel/ @vtangTT @arminaleTT @hkwonTT @sohaibnadeemTT
+/include/ttmlir/Conversion/D2MToTTNN/ @vtangTT @arminaleTT @hkwonTT @sohaibnadeemTT
+/include/ttmlir/Conversion/D2MToTTMetal/ @vtangTT @arminaleTT @hkwonTT @sohaibnadeemTT
+/test/ttmlir/Conversion/D2MToTTNN/ @vtangTT @arminaleTT @hkwonTT @sohaibnadeemTT
+/test/ttmlir/Conversion/D2MToTTMetal/ @vtangTT @arminaleTT @hkwonTT @sohaibnadeemTT
+/test/ttmlir/Dialect/D2M/arguments/ @vtangTT @arminaleTT @hkwonTT @sohaibnadeemTT
+
+# SFPI Dialect
+/include/ttmlir/Dialect/SFPI/ @tenstorrent/forge-developers-mlir-d2m
+/lib/Dialect/SFPI/ @tenstorrent/forge-developers-mlir-d2m
+/test/ttmlir/Conversion/SFPIToEmitC/ @tenstorrent/forge-developers-mlir-d2m
+/test/ttmlir/Dialect/SFPI/ @tenstorrent/forge-developers-mlir-d2m
+
+# LLVM Dialect
+/include/ttmlir/Dialect/LLVM/ @tenstorrent/forge-developers-mlir-core
+/lib/Dialect/LLVM/ @tenstorrent/forge-developers-mlir-core
+/test/ttmlir/Dialect/LLVM/ @tenstorrent/forge-developers-mlir-core
+
+# TT Dialect
+/include/ttmlir/Dialect/TTCore/ @tenstorrent/forge-developers-mlir-core @nsmithtt @mrakitaTT
+/lib/Dialect/TTCore/ @tenstorrent/forge-developers-mlir-core @nsmithtt @mrakitaTT
+/test/ttmlir/Dialect/TTCore/ @tenstorrent/forge-developers-mlir-core @nsmithtt @mrakitaTT
+
+# Metal Dialects
+/include/ttmlir/Dialect/TTKernel/ @tenstorrent/forge-developers-mlir-d2m
+/include/ttmlir/Dialect/TTMetal/ @tenstorrent/forge-developers-mlir-d2m
+/lib/Dialect/TTKernel/ @tenstorrent/forge-developers-mlir-d2m
+/lib/Dialect/TTMetal/ @tenstorrent/forge-developers-mlir-d2m
+/test/ttmlir/Dialect/TTKernel/ @tenstorrent/forge-developers-mlir-d2m
+/test/ttmlir/Dialect/TTMetal/ @tenstorrent/forge-developers-mlir-d2m
+/test/unittests/Allocation @tenstorrent/forge-developers-mlir-d2m
+
+# TTIR Erase Inverse Ops Optimization Pass
+/include/ttmlir/Dialect/TTIR/Transforms/EraseInverseOps/ @azecevicTT @odjuricicTT @mvasiljevicTT
+/lib/Dialect/TTIR/Transforms/EraseInverseOps/ @azecevicTT @odjuricicTT @mvasiljevicTT
+/test/ttmlir/Dialect/TTIR/Transforms/EraseInverseOps/ @azecevicTT @odjuricicTT @mvasiljevicTT
+
+# TTIR Fusing Passes
+/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp @tenstorrent/forge-developers-mlir-core @odjuricicTT @mvasiljevicTT
+/test/ttmlir/Dialect/TTIR/fusing/ @tenstorrent/forge-developers-mlir-core @odjuricicTT @mvasiljevicTT
+
+# TTNN Dialects
+/include/ttmlir/Dialect/TTNN/ @tenstorrent/forge-developers-mlir-core
+/lib/Dialect/TTNN/ @tenstorrent/forge-developers-mlir-core
+/test/ttmlir/Dialect/TTNN/ @tenstorrent/forge-developers-mlir-core
+
+# TTNN Utils
+/include/ttmlir/Dialect/TTNN/Utils/ @tenstorrent/forge-developers-mlir-core @tenstorrent/forge-developers-mlir-optimizer
+/lib/Dialect/TTNN/Utils/ @tenstorrent/forge-developers-mlir-core @tenstorrent/forge-developers-mlir-optimizer
+
+# TTNN Optimizer
+/include/ttmlir/Dialect/TTNN/Analysis/ @tenstorrent/forge-developers-mlir-optimizer
+/include/ttmlir/OpModel/ @tenstorrent/forge-developers-mlir-optimizer @arminaleTT @sgholamiTT
+/include/ttmlir/Scheduler/ @tenstorrent/forge-developers-mlir-optimizer
+/include/ttmlir/Dialect/TTNN/Validation @tenstorrent/forge-developers-mlir-optimizer
+/lib/Dialect/TTNN/Analysis/ @tenstorrent/forge-developers-mlir-optimizer
+/lib/Dialect/TTNN/Validation/ @tenstorrent/forge-developers-mlir-optimizer
+/lib/Dialect/TTNN/Transforms/OptimizerPasses @tenstorrent/forge-developers-mlir-optimizer
+/lib/OpModel/ @tenstorrent/forge-developers-mlir-optimizer @arminaleTT @sgholamiTT
+/lib/Scheduler/ @tenstorrent/forge-developers-mlir-optimizer
+/test/ttmlir/Dialect/TTNN/optimizer/ @tenstorrent/forge-developers-mlir-optimizer
+/test/ttmlir/Silicon/TTNN/**/optimizer/ @tenstorrent/forge-developers-mlir-optimizer
+/test/unittests/Optimizer @tenstorrent/forge-developers-mlir-optimizer
+/test/unittests/OpModel @tenstorrent/forge-developers-mlir-optimizer @arminaleTT @sgholamiTT
+/test/unittests/TestScheduler/ @tenstorrent/forge-developers-mlir-optimizer
+
+# TTNN Fusing Passes
+/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp @tenstorrent/forge-developers-mlir-core @odjuricicTT @mvasiljevicTT
+/test/ttmlir/Dialect/TTNN/fusing/ @tenstorrent/forge-developers-mlir-core @odjuricicTT @mvasiljevicTT
+
+# TTNN Collect Perf Metrics
+/lib/Dialect/TTNN/Transforms/TTNNCollectPerfMetrics.cpp @tenstorrent/forge-developers-mlir-optimizer
+
+# LLVM Target
+/include/ttmlir/Target/LLVM/ @tenstorrent/forge-developers-mlir-core
+/lib/Target/LLVM/ @tenstorrent/forge-developers-mlir-core
+
+# Metal Target
+/include/ttmlir/Target/TTKernel/ @tenstorrent/forge-developers-mlir-d2m
+/include/ttmlir/Target/TTMetal/ @tenstorrent/forge-developers-mlir-d2m
+/lib/Target/TTKernel/ @tenstorrent/forge-developers-mlir-d2m
+/lib/Target/TTMetal/ @tenstorrent/forge-developers-mlir-d2m
+
+# TTNN Target
+/include/ttmlir/Target/TTNN/ @tenstorrent/forge-developers-mlir-core
+/lib/Target/TTNN/ @tenstorrent/forge-developers-mlir-core
+
+# Runtime
+/runtime/ @tenstorrent/forge-developers-mlir-runtime
+/runtime/tools/ @jgrimTT @dlokeTT
+
+# PyKernel & ttnn-jit
+/tools/pykernel/ @xanderchin @vtangTT
+/test/pykernel/ @xanderchin @vtangTT
+/tools/ttnn-jit/ @xanderchin @vtangTT @arminaleTT @sgholamiTT
+/test/ttnn-jit/ @xanderchin @vtangTT @arminaleTT @sgholamiTT
+
+# Tooling
+/tools/builder @tenstorrent/forge-developers-mlir-tooling
+/tools/chisel @tenstorrent/forge-developers-mlir-tooling
+/tools/golden @tenstorrent/forge-developers-mlir-tooling
+/tools/ttrt @tenstorrent/forge-developers-mlir-tooling
+
+# d2m-jit
+/tools/d2m-jit/ @vwellsTT @nsmithtt @dlokeTT
+/test/d2m-jit/ @vwellsTT @nsmithtt @dlokeTT
+
+# tt-explorer
+/tools/explorer/ @tenstorrent/forge-developers-mlir-explorer
+
+# ttnn-standalone
+/tools/ttnn-standalone @tenstorrent/forge-developers-mlir-core
+
+# tt-alchemist
+/tools/tt-alchemist/ @tenstorrent/forge-developers-mlir-core
+
+# Scripts
+/tools/scripts/ @nsmithtt @ddilbazTT
+
+# python golden tests
+test/python/golden/d2m/test_dma.py @vtangTT
+
+# model snippet tests
+test/python/golden/mlir_snippets/models/ @nsmithtt @dlokeTT
+test/python/golden/d2m/test_snippets.py @nsmithtt @dlokeTT

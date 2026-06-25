@@ -1,0 +1,30 @@
+name: pre-commit
+
+on:
+  workflow_dispatch:
+  workflow_call:
+
+jobs:
+  pre-commit:
+
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: 3.12
+      - name: Run pre-commit
+        uses: andrewaylett/pre-commit-action@v4
+
+  check-spdx-headers:
+
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    steps:
+    - name: checkout
+      uses: actions/checkout@v5
+    - uses: enarx/spdx@master
+      with:
+        licenses: Apache-2.0

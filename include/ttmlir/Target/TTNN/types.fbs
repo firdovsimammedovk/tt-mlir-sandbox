@@ -1,0 +1,152 @@
+include "ttmlir/Target/Common/types.fbs";
+
+namespace tt.target.ttnn;
+
+enum TensorMemoryLayout: ushort {
+  Interleaved,
+  HeightSharded,
+  WidthSharded,
+  BlockSharded,
+  NDSharded,
+}
+
+enum StorageType: ushort {
+    Host,
+    Device,
+}
+
+enum ShardOrientation: uint32 {
+  RowMajor,
+  ColMajor,
+}
+
+enum ShardDistributionStrategy: uint32 {
+  RoundRobin1D,
+  Grid2D,
+}
+
+enum ShardStatus: uint32 {
+  Presharded,
+  Unsharded,
+}
+
+struct CoreCoord {
+  x: uint64;
+  y: uint64;
+}
+
+struct CoreRange {
+  start_coord: CoreCoord;
+  end_coord: CoreCoord;
+}
+
+table CoreRangeSet {
+  core_ranges: [CoreRange];
+}
+
+table ReplicateTensor {
+  replication_factor: uint32;
+}
+
+table ShardTensor {
+  shard_dim: uint32;
+}
+
+table ShardTensor2D {
+  shard_mesh: Dim2d;
+}
+
+table AllGatherTensor {
+
+}
+
+table ShardSpec {
+  core_range_set: CoreRangeSet;
+  shape: [int32];
+  orientation: ShardOrientation;
+}
+
+table NDShardSpec {
+  core_range_set: CoreRangeSet;
+  shape: [int32];
+  orientation: ShardOrientation;
+  distribution_strategy: ShardDistributionStrategy;
+}
+
+table MemoryConfig {
+  tensor_memory_layout: TensorMemoryLayout;
+  buffer_type: BufferType;
+  shard_spec: ShardSpec;
+  nd_shard_spec: NDShardSpec;
+}
+
+table MemoryDesc {
+  storage_type: StorageType;
+  tile_shape: Dim2d;
+  data_type: DataType;
+  memory_config: MemoryConfig;
+}
+
+table LayoutDesc {
+  oob_val: OOBVal;
+  memory_desc: MemoryDesc;
+}
+
+table TensorDesc {
+  shape: [int];
+  mesh_shape: [int32];
+  layout: LayoutDesc;
+  shard_status: ShardStatus;
+  local_shape: [int];
+}
+
+table TensorRef {
+  global_id: uint32;
+  desc: TensorDesc;
+}
+
+table GlobalSemaphoreRef {
+  global_id: uint32;
+}
+
+table FloatingPointType {
+  value: float;
+}
+
+table IntegralType {
+  value: int32;
+}
+
+union NumberType {
+  FP: FloatingPointType,
+  I32: IntegralType,
+}
+
+enum PlacementType: ushort {
+    Replicate,
+    Shard,
+}
+
+struct Placement {
+  type: PlacementType;
+  dim: int32;
+}
+
+table MeshMapperConfig {
+  placements: [Placement];
+  mesh_shape_override: [uint32];
+}
+
+table MeshComposerConfig {
+  dims: [int32];
+  mesh_shape_override: [uint32];
+}
+
+table MeshCoord {
+  coords: [uint32];
+}
+
+table MeshCoordRange {
+  start: MeshCoord;
+  end: MeshCoord;
+}

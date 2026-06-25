@@ -1,0 +1,23 @@
+add_subdirectory(Allocation)
+
+add_mlir_dialect_library(MLIRD2MAnalysis
+  BlockFactorAnalysis.cpp
+  GenericOpBufferAnalysis.cpp
+  CBProducerConsumer.cpp
+  GenericInterchangeAnalysis.cpp
+  GridAnalysis.cpp
+
+  ADDITIONAL_HEADER_DIRS
+  ${PROJECT_SOURCE_DIR}/include/ttmlir
+
+  DEPENDS
+    MLIRD2MOpsIncGen
+    MLIRTTCoreOpsIncGen
+
+  LINK_LIBS PUBLIC
+    MLIRAnalysis
+    MLIRD2MAllocation
+    MLIRD2MUtils
+    MLIRTTCoreDialect
+    MLIRTTIRDialect
+)

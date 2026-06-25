@@ -1,0 +1,161 @@
+
+include "ttmlir/Target/Common/types.fbs";
+include "ttmlir/Target/Common/system_desc.fbs";
+include "ttmlir/Target/TTNN/types.fbs";
+include "ttmlir/Target/TTNN/binary.fbs";
+
+namespace tt.runtime.distributed.flatbuffer;
+
+table ErrorResponse {
+  message: string;
+}
+
+table ConfigureRuntimeContextResponse {
+}
+
+table SetMemoryLogLevelResponse {
+}
+
+table GetSystemDescResponse {
+  system_desc: [ubyte]; // size-prefixed SystemDescRoot buffer
+}
+
+table SetFabricConfigResponse {
+}
+
+table GetNumAvailableDevicesResponse {
+  num_devices: uint32;
+}
+
+table OpenMeshDeviceResponse {
+  device: tt.target.DeviceRef;
+}
+
+table CloseMeshDeviceResponse {
+}
+
+table CreateSubMeshDeviceResponse {
+  sub_mesh: tt.target.DeviceRef;
+}
+
+table ReleaseSubMeshDeviceResponse {
+}
+
+table GetMeshShapeResponse {
+  shape: [uint32];
+}
+
+table CreateHostTensorResponse {
+}
+
+table CreateMultiDeviceHostTensorFromShardsResponse {
+}
+
+table CreateUnsafeBorrowedHostTensorResponse {
+}
+
+table IsTensorAllocatedResponse {
+  allocated: bool;
+}
+
+table GetTensorVolumeResponse {
+  volume: uint32;
+}
+
+table GetTensorRetainResponse {
+  retain: bool;
+}
+
+table SetTensorRetainResponse {
+}
+
+table GetLayoutResponse {
+}
+
+table ToLayoutResponse {
+}
+
+table SubmitResponse {
+}
+
+table GetNumShardsResponse {
+  num_shards: uint32;
+}
+
+table ToHostResponse {
+}
+
+table MemcpyResponse {
+  data: [ubyte];
+}
+
+table DeallocateTensorResponse {
+}
+
+table ShutdownResponse {
+}
+
+table TensorDescFlat {
+  shape: [uint32];
+  data_type: tt.target.DataType;
+  itemsize: uint32;
+  stride: [int64];
+  physical_volume: uint64;
+}
+
+table GetTensorDescResponse{
+  tensor_desc: TensorDescFlat;
+}
+
+table HasLayoutResponse{
+  has_layout: bool;
+}
+
+table IsProgramCacheEnabledResponse{
+  enabled: bool;
+}
+
+table ClearProgramCacheResponse{
+}
+
+union ResponseType {
+  ErrorResponse,
+  ConfigureRuntimeContextResponse,
+  SetMemoryLogLevelResponse,
+  GetSystemDescResponse,
+  SetFabricConfigResponse,
+  GetNumAvailableDevicesResponse,
+  OpenMeshDeviceResponse,
+  CloseMeshDeviceResponse,
+  CreateSubMeshDeviceResponse,
+  ReleaseSubMeshDeviceResponse,
+  GetMeshShapeResponse,
+  CreateHostTensorResponse,
+  CreateMultiDeviceHostTensorFromShardsResponse,
+  IsTensorAllocatedResponse,
+  GetTensorVolumeResponse,
+  GetTensorRetainResponse,
+  SetTensorRetainResponse,
+  GetLayoutResponse,
+  ToLayoutResponse,
+  SubmitResponse,
+  GetNumShardsResponse,
+  ToHostResponse,
+  MemcpyResponse,
+  DeallocateTensorResponse,
+  ShutdownResponse,
+  GetTensorDescResponse,
+  HasLayoutResponse,
+  IsProgramCacheEnabledResponse,
+  ClearProgramCacheResponse,
+  CreateUnsafeBorrowedHostTensorResponse
+}
+
+table Response {
+  command_id: uint64;
+  type: ResponseType;
+}
+
+root_type Response;
+file_identifier "DRSP";
+file_extension "distrsp";

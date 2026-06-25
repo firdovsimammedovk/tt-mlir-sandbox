@@ -1,0 +1,135 @@
+# SPDX-FileCopyrightText: (c) 2024 Tenstorrent AI ULC
+#
+# SPDX-License-Identifier: Apache-2.0
+
+import ttmlir
+from ttmlir.ir import *
+from ttmlir.dialects import ttir, func, ttcore, tensor
+import sys
+
+uid = -1
+
+
+def filter_dialect_ops(block, dialects=["ttir", "ttnn"], op_filter=None):
+    for op in block.operations:
+        regions = op.regions
+        if len(regions) > 0:
+            assert len(regions) == 1
+            blocks = regions[0].blocks
+            assert len(blocks) == 1
+            yield from filter_dialect_ops(
+                blocks[0], dialects=dialects, op_filter=op_filter
+            )
+        else:
+            dialect = op.name.split(".")[0]
+            if dialect in dialects and (op_filter == None or op.name == op_filter):
+                yield op
+
+
+def get_line_number(location):
+    global uid
+    uid += 1
+    return uid
+
+
+def get_entry_name(op):
+    original_entry_name = op.parent.attributes["sym_name"]
+    line_number = get_line_number(op.location)
+    entry_name = f"{original_entry_name}_{op.name}_{line_number}"
+    entry_name = entry_name.replace(".", "_").replace('"', "")
+    return entry_name
+
+
+def get_op_operands(op):
+    if "operandSegmentSizes" in op.attributes:
+        segments = op.attributes["operandSegmentSizes"]
+        assert len(segments) == 2
+        ins, outs = segments
+        assert ins + outs == len(op.operands)
+        return (op.operands[:ins], op.operands[ins:])
+    return (op.operands, [])
+
+
+def emit_op_as_entry_point(op, ip=None, loc=None):
+    results = op.results
+    op_inputs, op_outputs = get_op_operands(op)
+    input_types = [op_input.type for op_input in op_inputs]
+    output_types = [op_output.type for op_output in op_outputs]
+    result_types = [result.type for result in results]
+    entry = func.FuncOp(get_entry_name(op), (input_types, result_types), ip=ip, loc=loc)
+    entry_block = Block.create_at_start(entry.body, input_types)
+    with InsertionPoint(entry_block) as ip, op.location as loc:
+        operands = [arg for arg in entry_block.arguments]
+        for output_type in output_types:
+            operands.append(
+                ttir.empty(
+                    output_type.shape,
+                    output_type.element_type,
+                    encoding=output_type.encoding,
+                    ip=ip,
+                    loc=loc,
+                )
+            )
+        attrs = {attr.name: attr.attr for attr in op.attributes}
+        assert len(op.regions) == 0, "Regions are not supported yet."
+        new_op = Operation.create(
+            name=op.name,
+            results=result_types,
+            operands=operands,
+            attributes=attrs,
+            successors=op.successors,
+            regions=len(op.regions),
+            loc=loc,
+            ip=ip,
+        )
+        new_op.verify()
+
+        ret_op = Operation.create(
+            name="func.return",
+            results=[],
+            operands=new_op.results,
+            loc=loc,
+            ip=ip,
+        )
+
+
+def stringify(op):
+    attrs = ",".join(f"{attr.name}={str(attr.attr)}" for attr in op.attributes)
+    operand_types = ",".join(str(op.type) for op in op.operands)
+    result_types = ",".join(str(res.type) for res in op.results)
+    return f"{op.name}({operand_types}) -> ({result_types}) {{{attrs}}}"
+
+
+def parted(in_modules, op_filter=None):
+    if len(in_modules) == 0:
+        return None
+    cursor = Location.unknown(in_modules[0].context)
+    out_module = Module.create(cursor)
+    unique = set()
+    with InsertionPoint(out_module.body) as ip, Location.unknown() as loc:
+        for in_module in in_modules:
+            for op in filter_dialect_ops(in_module.body, op_filter=op_filter):
+                if stringify(op) in unique:
+                    continue
+                unique.add(stringify(op))
+                emit_op_as_entry_point(op, ip=ip, loc=loc)
+    return out_module
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="parted: a tool for filtering out operations from a module for isolated op testing"
+    )
+
+    parser.add_argument("mlir", nargs="*", type=str, help="Path to the mlir file")
+    parser.add_argument(
+        "--op-filter", type=str, help="List of ops to filter", default=None
+    )
+    args = parser.parse_args()
+
+    with Context() as ctx:
+        ctx.allow_unregistered_dialects = True
+        modules = [Module.parse(open(mlir, "r").read()) for mlir in args.mlir]
+        print(parted(modules, op_filter=args.op_filter))

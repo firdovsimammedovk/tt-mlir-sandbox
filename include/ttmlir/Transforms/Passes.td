@@ -1,0 +1,157 @@
+// SPDX-FileCopyrightText: (c) 2025 Tenstorrent AI ULC
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#ifndef TTMLIR_TRANSFORMS_PASSES_TD
+#define TTMLIR_TRANSFORMS_PASSES_TD
+
+include "mlir/Pass/PassBase.td"
+
+def ConstEvalHoistTransform: Pass<"const-eval-hoist-transform", "::mlir::ModuleOp"> {
+  let summary = "Transform to hoist const-eval subgraph into separate func(s)";
+  let description = [{
+    Transform pass which runs an analysis pass to find const-eval subgraphs in an input
+    and hoist them into separate functions.
+    This pass is dialect-agnostic, although ops with TT traits TTCoreCreationOpTrait and TTCoreDuplicateConstEvalTrait have special logic.
+    If this pass is run on IR which has already been const-eval'ed, it will first undo existing const-eval hoisting and then re-run.
+
+    Example:
+
+    func.func @forward(%arg0: tensor<32x32xbf16> {ttcore.argument_type = #ttcore.argument_type<input>}, %arg1: tensor<32x32xbf16> {ttcore.argument_type = #ttcore.argument_type<parameter>}, %arg2: tensor<32x32xbf16> {ttcore.argument_type = #ttcore.argument_type<parameter>}, %arg3: tensor<32x32xbf16> {ttcore.argument_type = #ttcore.argument_type<constant>}) -> tensor<32x32xbf16> {
+      %0 = tensor.empty() : tensor<32x32xbf16>
+      %1 = "ttir.add"(%arg0, %arg1, %0) : (tensor<32x32xbf16>, tensor<32x32xbf16>, tensor<32x32xbf16>) -> tensor<32x32xbf16>
+      %2 = tensor.empty() : tensor<32x32xbf16>
+      %3 = "ttir.subtract"(%arg2, %arg3, %2) : (tensor<32x32xbf16>, tensor<32x32xbf16>, tensor<32x32xbf16>) -> tensor<32x32xbf16>
+      %4 = tensor.empty() : tensor<32x32xbf16>
+      %5 = "ttir.add"(%1, %3, %4) : (tensor<32x32xbf16>, tensor<32x32xbf16>, tensor<32x32xbf16>) -> tensor<32x32xbf16>
+      return %5 : tensor<32x32xbf16>
+    }
+
+    becomes:
+
+    func.func @forward(%arg0: tensor<32x32xbf16> {ttcore.argument_type = #ttcore.argument_type<input>}, %arg1: tensor<32x32xbf16> {ttcore.argument_type = #ttcore.argument_type<parameter>}, %arg2: tensor<32x32xbf16> {ttcore.argument_type = #ttcore.argument_type<parameter>}, %arg3: tensor<32x32xbf16> {ttcore.argument_type = #ttcore.argument_type<constant>}) -> tensor<32x32xbf16> {
+      %0 = ttcore.load_cached(@forward_const_eval_0, [%arg2, %arg3]) : (tensor<32x32xbf16>, tensor<32x32xbf16>) -> tensor<32x32xbf16>
+      %1 = tensor.empty() : tensor<32x32xbf16>
+      %2 = "ttir.add"(%arg0, %arg1, %1) : (tensor<32x32xbf16>, tensor<32x32xbf16>, tensor<32x32xbf16>) -> tensor<32x32xbf16>
+      %3 = tensor.empty() : tensor<32x32xbf16>
+      %4 = "ttir.add"(%2, %0, %3) : (tensor<32x32xbf16>, tensor<32x32xbf16>, tensor<32x32xbf16>) -> tensor<32x32xbf16>
+      return %4 : tensor<32x32xbf16>
+    }
+    func.func @forward_const_eval_0(%arg0: tensor<32x32xbf16>, %arg1: tensor<32x32xbf16>) -> tensor<32x32xbf16> attributes {tt.function_type = "const_eval"} {
+      %0 = tensor.empty() : tensor<32x32xbf16>
+      %1 = "ttir.subtract"(%arg0, %arg1, %0) : (tensor<32x32xbf16>, tensor<32x32xbf16>, tensor<32x32xbf16>) -> tensor<32x32xbf16>
+      return %1 : tensor<32x32xbf16>
+    }
+
+  }];
+
+  let dependentDialects = ["::mlir::tt::ttcore::TTCoreDialect"];
+}
+
+def UndoConstEvalTransform : Pass<"undo-const-eval", "mlir::ModuleOp"> {
+  let summary = "Undo const-eval hoisting by inlining const-eval functions";
+  let description = [{
+    This pass inlines all functions marked with the "const_eval" attribute,
+    effectively undoing the transformations performed by ConstEvalHoistTransform.
+  }];
+
+  let dependentDialects = ["::mlir::tt::ttcore::TTCoreDialect"];
+}
+
+def CollapseParallelLoops: Pass<"collapse-parallel-loops", "::mlir::func::FuncOp"> {
+  let summary = "Collapse and reverse dimensions in multidimensional SCF parallel loops";
+  let description = [{
+    This pass collapses the last dimensions of SCF parallel loops to three dimensions and then reverses the parameter order to improve memory locality.
+
+    Example transformation:
+    ```mlir
+    // Before:
+    scf.parallel (%i, %j, %k, %l) = (0, 0, 0, 0) to (8, 224, 224, 3) step (1, 1, 1, 1) {
+      // loop body using %i, %j, %k, %l
+    }
+
+    // After:
+    scf.parallel (%merged, %j, %i) = (0, 0, 0) to (672, 224, 8) step (1, 1, 1) {
+      %k = arith.divui %merged, %c3 : index
+      %l = arith.remui %merged, %c3 : index
+      // loop body using %i, %j, %k, %l
+    }
+    ```
+  }];
+
+  let dependentDialects = ["::mlir::scf::SCFDialect", "::mlir::arith::ArithDialect"];
+}
+
+def EmbedCudaTargetAttributes : Pass<"embed-cuda-target-attributes", "::mlir::ModuleOp"> {
+  let summary = "Embed CUDA target attributes into module for flatbuffer translation.";
+  let description = [{
+    This pass embeds CUDA target information (chip, features, optimization level)
+    as module attributes so they can be read during flatbuffer translation instead
+    of relying on command-line options.
+
+    The pass adds these attributes to the module:
+    - cuda.chip: Target GPU architecture (e.g., "sm_80", "sm_90")
+    - cuda.features: PTX features (e.g., "+ptx70")
+    - cuda.opt_level: Optimization level (0-3)
+
+    Example:
+    ```mlir
+    module attributes {
+      cuda.chip = "sm_50",
+      cuda.features = "+ptx50",
+      cuda.opt_level = 2 : i32
+    } {
+      // module content
+    }
+    ```
+  }];
+
+  let options = [
+    Option<"chip", "chip", "std::string", /*default=*/"\"sm_50\"",
+           "Target GPU chip architecture">,
+    Option<"features", "features", "std::string", /*default=*/"\"+ptx50\"",
+           "PTX features string">,
+    Option<"opt_level", "opt-level", "int32_t", /*default=*/"2",
+           "Optimization level (0-3)">
+  ];
+}
+
+def ExtractGPUModules: Pass<"extract-gpu-modules", "::mlir::ModuleOp">
+{
+  let summary = "Extract GPU kernel functions from LLVM into a single module";
+  let description = [{
+    This pass removes host code from llvm and extracts all functions of gpu modules into a single module.
+
+    Example:
+    ```
+    module @Example attributes {gpu.container_module} {
+      llvm.func @host_function
+      ...
+      gpu.module @kernel_1
+      {
+        llvm.func @kernel_func
+        ...
+      }
+      ...
+      gpu.module @kernel_n
+      {
+        llvm.func @kernel_func
+        ...
+      }
+    }
+    ```
+    becomes:
+
+    ```
+    module {
+      llvm.func @kernel_1_kernel_func
+      ...
+      llvm.func @kernel_n_kernel_func
+    }
+    ```
+
+  }];
+  let dependentDialects = ["mlir::LLVM::LLVMDialect"];
+}
+
+#endif

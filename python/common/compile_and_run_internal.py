@@ -1,0 +1,213 @@
+# SPDX-FileCopyrightText: (c) 2024 Tenstorrent AI ULC
+#
+# SPDX-License-Identifier: Apache-2.0
+
+from __future__ import annotations
+
+from multiprocessing import queues
+from typing import Callable, Tuple
+
+from ttmlir.ir import Module
+from ttmlir.passes import (
+    stablehlo_to_ttir_pipeline,
+    ttir_to_ttmetal_backend_pipeline,
+    ttir_to_ttnn_runtime_pipeline,
+    ttmetal_to_flatbuffer_file,
+    ttnn_to_flatbuffer_file,
+)
+
+from .compile_and_run_utils import *
+
+# ---------- Utility wrappers around compiler passes ----------
+
+
+def stablehlo_to_ttir_pipeline_worker(
+    module_str: str, result_queue: queues.Queue
+) -> None:
+    """
+    Wrapper around `stablehlo_to_ttir_pipeline` pybound pass.
+
+    It is not resistant to segfaults, i.e. some unpredictable errors that can happen
+    inside the pybound call. Thus it is meant to be used as a worker for a mp.Process
+    which will guard the caller from such errors.
+    """
+    try:
+        module = create_mlir_module_from_string(module_str)
+
+        stablehlo_to_ttir_pipeline(module)
+
+        result_queue.put(CompilationProcessResult.success(str(module)))
+    except Exception as e:
+        result_queue.put(CompilationProcessResult.error(str(e)))
+
+
+def ttir_to_ttnn_runtime_pipeline_worker(
+    module_str: str, system_desc: str, result_queue: queues.Queue
+) -> None:
+    """
+    Wrapper around `ttir_to_ttnn_runtime_pipeline` pybound pass.
+
+    It is not resistant to segfaults, i.e. some unpredictable errors that can happen
+    inside the pybound call. Thus it is meant to be used as a worker for a Process
+    which will guard the caller from such errors.
+    """
+    try:
+        module = create_mlir_module_from_string(module_str)
+
+        ttir_to_ttnn_runtime_pipeline(module, f"system-desc-path={system_desc}")
+
+        result_queue.put(CompilationProcessResult.success(str(module)))
+    except Exception as e:
+        result_queue.put(CompilationProcessResult.error(str(e)))
+
+
+def ttir_to_ttmetal_backend_pipeline_worker(
+    module_str: str, system_desc: str, result_queue: queues.Queue
+) -> None:
+    """
+    Wrapper around `ttir_to_ttmetal_backend_pipeline` pybound pass.
+
+    It is not resistant to segfaults, i.e. some unpredictable errors that can happen
+    inside the pybound call. Thus it is meant to be used as a worker for a Process
+    which will guard the caller from such errors.
+    """
+    try:
+        module = create_mlir_module_from_string(module_str)
+
+        ttir_to_ttmetal_backend_pipeline(module, f"system-desc-path={system_desc}")
+
+        result_queue.put(CompilationProcessResult.success(str(module)))
+    except Exception as e:
+        result_queue.put(CompilationProcessResult.error(str(e)))
+
+
+# ---------- Utility wrappers around translation passes ----------
+
+
+def ttnn_to_flatbuffer_file_worker(
+    module_str: str, output_file_name: str, result_queue: queues.Queue
+) -> None:
+    """
+    Wrapper around `ttnn_to_flatbuffer_file` pybound pass.
+
+    It is not resistant to segfaults, i.e. some unpredictable errors that can happen
+    inside the pybound call. Thus it is meant to be used as a worker for a Process
+    which will guard the caller from such errors.
+    """
+    try:
+        module = create_mlir_module_from_string(module_str)
+
+        ttnn_to_flatbuffer_file(module, output_file_name, {}, {})
+
+        result_queue.put(TranslationProcessResult.success(output_file_name))
+    except Exception as e:
+        result_queue.put(TranslationProcessResult.error(str(e)))
+
+
+def ttmetal_to_flatbuffer_file_worker(
+    module_str: str, output_file_name: str, result_queue: queues.Queue
+) -> None:
+    """
+    Wrapper around `ttmetal_to_flatbuffer_file` pybound pass.
+
+    It is not resistant to segfaults, i.e. some unpredictable errors that can happen
+    inside the pybound call. Thus it is meant to be used as a worker for a Process
+    which will guard the caller from such errors.
+    """
+    try:
+        module = create_mlir_module_from_string(module_str)
+
+        ttmetal_to_flatbuffer_file(module, output_file_name)
+
+        result_queue.put(TranslationProcessResult.success(output_file_name))
+    except Exception as e:
+        result_queue.put(TranslationProcessResult.error(str(e)))
+
+
+# ---------- Public API ----------
+
+
+def run_compilation_process(
+    worker_fn: Callable,
+    worker_args_without_queue: Tuple = (),
+) -> Module:
+    """
+    Runs `worker_fn` (function doing some compilation pass) in a separate process,
+    returns produced Module if no errors happened, otherwise raises RuntimeError.
+    """
+    process_manager = get_process_manager()
+    result: CompilationProcessResult = process_manager.run(
+        worker_fn, worker_args_without_queue
+    )
+    return create_mlir_module_from_string(result.module_str)
+
+
+def run_translation_process(
+    worker_fn: Callable,
+    worker_args_without_queue: Tuple = (),
+) -> str:
+    """
+    Runs `worker_fn` (function doing some translation pass) in a separate process,
+    returns path to produced flatbuffer file if no errors happened, otherwise
+    raises RuntimeError.
+    """
+    process_manager = get_process_manager()
+    result: TranslationProcessResult = process_manager.run(
+        worker_fn, worker_args_without_queue
+    )
+    return result.fb_file_path
+
+
+def run_flatbuffer_execution_process(
+    flatbuffer_file_path: str,
+    timeout: float = 60,
+) -> int:
+    """
+    Runs flatbuffer on device using subprocess for clean hardware shutdown.
+
+    Subprocess is used (not multiprocessing) to ensure C++ destructors run,
+    preventing hardware state corruption that would require manual reset.
+    """
+    result = run_subprocess_worker(
+        "_flatbuffer_worker.py", (flatbuffer_file_path,), timeout
+    )
+
+    if result["status"] == "error":
+        error = result.get("error", "Unknown error")
+        stderr = _extract_error_from_stderr(result.get("stderr", ""))
+        msg = f"{error}\n{stderr}".strip() if stderr else error
+        raise RuntimeError(f"{msg}")
+
+    return result["return_code"]
+
+
+def _extract_error_from_stderr(stderr: str) -> str:
+    """Extracts ERROR lines and following info blocks from stderr.
+
+    Keeps ERROR log lines and the non-backtrace, non-log context that follows
+    them.
+    """
+    if not stderr:
+        return ""
+
+    lines = stderr.splitlines()
+    extracted = []
+    capturing_info = False
+
+    for line in lines:
+        if "- ERROR -" in line:
+            extracted.append(line)
+            capturing_info = True
+        elif capturing_info:
+            stripped = line.strip()
+            if (
+                stripped.startswith("---")
+                or stripped == "backtrace:"
+                or "- INFO -" in line
+                or "- WARNING -" in line
+            ):
+                capturing_info = False
+            elif stripped:
+                extracted.append(line)
+
+    return "\n".join(extracted)

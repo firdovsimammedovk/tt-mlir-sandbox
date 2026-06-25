@@ -1,0 +1,57 @@
+ARG FROM_TAG=latest
+
+# Multi-stage build to optimize for both base and ci images
+# This stage creates a shared install script
+FROM ghcr.io/tenstorrent/tt-mlir/tt-mlir-base-ubuntu-24-04:${FROM_TAG} AS ird-builder
+SHELL ["/bin/bash", "-c"]
+
+# Set environment variables for build stage
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN echo " \
+  apt-get update && apt-get install -y \
+    gdb \
+    ssh \
+    sudo \
+    wget \
+    vim \
+    nano \
+    tmux \
+    psmisc \
+    bash-completion \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*" > _install.sh && chmod +x _install.sh
+
+# Base image stage
+FROM ghcr.io/tenstorrent/tt-mlir/tt-mlir-base-ubuntu-24-04:${FROM_TAG} AS base-ird
+
+SHELL ["/bin/bash", "-c"]
+
+# Set environment variables
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TTMLIR_TOOLCHAIN_DIR=/opt/ttmlir-toolchain
+
+# Copy and run the install script
+COPY --from=ird-builder /_install.sh /_install.sh
+RUN /_install.sh && rm /_install.sh
+
+# Create a directory for the toolchain and set permissions
+RUN mkdir -p $TTMLIR_TOOLCHAIN_DIR && \
+    chmod -R 777 $TTMLIR_TOOLCHAIN_DIR
+
+# CI image stage
+ARG FROM_TAG=latest
+FROM ghcr.io/tenstorrent/tt-mlir/tt-mlir-ci-ubuntu-24-04:${FROM_TAG} AS ird
+SHELL ["/bin/bash", "-c"]
+
+# Set environment variables
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TTMLIR_TOOLCHAIN_DIR=/opt/ttmlir-toolchain
+
+# Copy and run the install script
+COPY --from=ird-builder /_install.sh /_install.sh
+RUN /_install.sh && rm /_install.sh
+
+# Create a directory for the toolchain and set permissions
+RUN mkdir -p $TTMLIR_TOOLCHAIN_DIR && \
+    chmod -R 777 $TTMLIR_TOOLCHAIN_DIR

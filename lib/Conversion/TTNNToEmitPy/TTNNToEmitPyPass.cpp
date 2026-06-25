@@ -1,0 +1,177 @@
+// SPDX-FileCopyrightText: (c) 2025 Tenstorrent AI ULC
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#include "ttmlir/Conversion/TTNNToEmitPy/EmitPyConversion.h"
+#include "ttmlir/Conversion/TTNNToEmitPy/TTNNToEmitPy.h"
+#include "ttmlir/Dialect/EmitPy/IR/EmitPy.h"
+#include "ttmlir/Dialect/EmitPy/IR/EmitPyTypes.h"
+#include "ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h"
+#include "ttmlir/FunctionTypes.h"
+
+#include "mlir/Dialect/Func/Transforms/FuncConversions.h"
+#include "mlir/Pass/PassManager.h"
+
+using namespace mlir;
+using namespace mlir::tt;
+
+namespace mlir::tt::ttnn {
+
+#define GEN_PASS_DEF_CONVERTTTNNTOEMITPY
+#include "ttmlir/Conversion/Passes.h.inc"
+
+} // namespace mlir::tt::ttnn
+
+namespace {
+
+class TTNNToEmitPyTypeConverter : public TypeConverter {
+public:
+  TTNNToEmitPyTypeConverter(MLIRContext *ctx) {
+    addConversion([](Type type) { return type; });
+    addConversion([ctx](tt::ttnn::DeviceType type) -> emitpy::OpaqueType {
+      return emitpy::OpaqueType::get(ctx, "ttnn.Device");
+    });
+    addConversion([ctx](mlir::TensorType type) -> emitpy::OpaqueType {
+      return emitpy::OpaqueType::get(ctx,
+                                     ttnn_to_emitpy::TypeNameV<::ttnn::Tensor>);
+    });
+    addConversion([ctx](mlir::TupleType type) -> emitpy::OpaqueType {
+      return emitpy::OpaqueType::get(
+          ctx, ttnn_to_emitpy::TypeNameV<std::vector<::ttnn::Tensor>>);
+    });
+    addConversion(
+        [ctx](tt::ttnn::GlobalSemaphoreType type) -> emitpy::OpaqueType {
+          return emitpy::OpaqueType::get(ctx, "ttnn.GlobalSemaphore");
+        });
+    addConversion([ctx](tt::ttcore::DictType type) -> emitpy::DictType {
+      return emitpy::DictType::get(ctx, Type(), Type());
+    });
+  }
+};
+
+struct ConvertTTNNToEmitPyPass
+    : public tt::ttnn::impl::ConvertTTNNToEmitPyBase<ConvertTTNNToEmitPyPass> {
+
+  using tt::ttnn::impl::ConvertTTNNToEmitPyBase<
+      ConvertTTNNToEmitPyPass>::ConvertTTNNToEmitPyBase;
+
+  void runOnOperation() override {
+    mlir::ModuleOp module = getOperation();
+    mlir::ConversionTarget target(getContext());
+    target.addLegalDialect<emitpy::EmitPyDialect>();
+    target.addIllegalDialect<tt::ttnn::TTNNDialect>();
+    // mlir::ModuleOp is legal only if no attributes are present on it
+    //
+    target.addDynamicallyLegalOp<mlir::ModuleOp>(
+        [&](mlir::ModuleOp op) { return op->getAttrs().empty(); });
+
+    OpBuilder builder(module);
+
+    if (module.getBodyRegion().empty()) {
+      // Parent module is empty, nothing to do here
+      //
+      signalPassFailure();
+    }
+
+    // If we are in the module-export path (i.e., `target-module=true`),
+    // const-eval functions must also take `device` as an explicit argument so
+    // they can avoid materializing `ttnn.get_device` in the function body.
+    //
+    if (this->targetModule) {
+      targetModuleConversion(module);
+    }
+
+    // TTNN -> EmitPy
+    //
+    {
+      TTNNToEmitPyTypeConverter typeConverter(&getContext());
+      RewritePatternSet patterns(&getContext());
+
+      // Func dialect handling
+      //
+      populateFunctionOpInterfaceTypeConversionPattern<func::FuncOp>(
+          patterns, typeConverter);
+      target.addDynamicallyLegalOp<func::FuncOp>([&](func::FuncOp op) {
+        return typeConverter.isSignatureLegal(op.getFunctionType()) &&
+               typeConverter.isLegal(&op.getBody());
+      });
+      populateReturnOpTypeConversionPattern(patterns, typeConverter);
+      target.addDynamicallyLegalOp<func::ReturnOp>(
+          [&](func::ReturnOp op) { return typeConverter.isLegal(op); });
+      populateCallOpTypeConversionPattern(patterns, typeConverter);
+      target.addDynamicallyLegalOp<func::CallOp>(
+          [&](func::CallOp op) { return typeConverter.isLegal(op); });
+
+      // TTNN -> EmitPy patterns
+      //
+      populateTTNNToEmitPyPatterns(&getContext(), patterns, typeConverter);
+
+      // Apply full conversion
+      //
+      if (failed(applyFullConversion(getOperation(), target,
+                                     std::move(patterns)))) {
+        signalPassFailure();
+        return;
+      }
+    }
+  }
+
+  // This function is used to convert the const-eval functions to accept a
+  // device argument. This is duplicated from
+  // `lib/Dialect/TTNN/Transforms/Passes.cpp@TTNNPrepareModuleForExport` because
+  // `ttcore.load_cached` op expects const-eval function without device
+  // argument. Issue: https://github.com/tenstorrent/tt-mlir/issues/6746
+  void targetModuleConversion(ModuleOp moduleOp) {
+    IRRewriter rewriter(&getContext());
+    mlir::tt::ttnn::DeviceType deviceType =
+        mlir::tt::ttnn::DeviceType::get(&getContext());
+
+    moduleOp.walk([&](func::FuncOp funcOp) {
+      if (!ttmlir::utils::isConstEvalFunc(funcOp) || funcOp.isExternal()) {
+        return;
+      }
+
+      // Append a device argument to the const-eval function signature.
+      // Use `insertArgument` so the function type, entry-block arguments, and
+      // `arg_attrs` array are grown atomically — calling `setArgAttr` after a
+      // manual `setFunctionType`/`addArgument` would index past the end of an
+      // existing `arg_attrs` array (e.g., when an arg already carries
+      // `ttir.conv2d_weight`).
+      //
+      unsigned deviceArgIndex = funcOp.getNumArguments();
+      DictionaryAttr deviceArgAttrs =
+          rewriter.getDictionaryAttr({rewriter.getNamedAttr(
+              ttnn_to_emitpy::kNameAttr, rewriter.getStringAttr("device"))});
+      if (failed(funcOp.insertArgument(deviceArgIndex, deviceType,
+                                       deviceArgAttrs, funcOp.getLoc()))) {
+        signalPassFailure();
+        return;
+      }
+      BlockArgument deviceArg = funcOp.getArgument(deviceArgIndex);
+
+      // Replace all GetDeviceOp operations with the new device argument.
+      //
+      SmallVector<mlir::tt::ttnn::GetDeviceOp> getDeviceOps;
+      funcOp.walk(
+          [&](mlir::tt::ttnn::GetDeviceOp op) { getDeviceOps.push_back(op); });
+      for (auto op : getDeviceOps) {
+        rewriter.replaceOp(op, deviceArg);
+      }
+    });
+  }
+};
+
+} // namespace
+
+namespace mlir::tt {
+
+std::unique_ptr<OperationPass<ModuleOp>> createConvertTTNNToEmitPyPass() {
+  return std::make_unique<ConvertTTNNToEmitPyPass>();
+}
+
+std::unique_ptr<OperationPass<ModuleOp>>
+createConvertTTNNToEmitPyPass(const ConvertTTNNToEmitPyOptions &options) {
+  return std::make_unique<ConvertTTNNToEmitPyPass>(options);
+}
+
+} // namespace mlir::tt

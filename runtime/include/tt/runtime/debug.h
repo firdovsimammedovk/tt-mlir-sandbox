@@ -1,0 +1,228 @@
+// SPDX-FileCopyrightText: (c) 2024 Tenstorrent AI ULC
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#ifndef TT_RUNTIME_DEBUG_H
+#define TT_RUNTIME_DEBUG_H
+
+#include <cassert>
+#include <functional>
+#include <optional>
+#include <ostream>
+#include <shared_mutex>
+
+#include "tt/runtime/types.h"
+
+#if defined(TT_RUNTIME_DEBUG) && TT_RUNTIME_DEBUG == 1
+#define RUNTIME_DEBUG_MAYBE_INLINE
+#else
+#define RUNTIME_DEBUG_MAYBE_INLINE inline __attribute__((always_inline))
+#endif
+
+namespace tt::runtime::debug {
+
+struct Env {
+#if defined(TT_RUNTIME_DEBUG) && TT_RUNTIME_DEBUG == 1
+  static const Env &
+#else
+  static Env
+#endif
+  get(bool dumpKernels = false, bool loadKernels = false,
+      bool useLocForKernelName = false, std::string kernelSourceDir = {},
+      bool deviceAddressValidation = false, bool blockingCQ = false)
+#if defined(TT_RUNTIME_DEBUG) && TT_RUNTIME_DEBUG == 1
+      ;
+#else
+  {
+    return Env(false, false, false, {}, false, false);
+  }
+#endif
+
+  bool dumpKernels;
+  bool loadKernels;
+  bool useLocForKernelName;
+  std::string kernelSourceDir;
+  bool deviceAddressValidation;
+  bool blockingCQ;
+
+private:
+  Env(bool dumpKernels, bool loadKernels, bool useLocForKernelName,
+      std::string kernelSourceDir, bool deviceAddressValidation,
+      bool blockingCQ)
+      : dumpKernels(dumpKernels), loadKernels(loadKernels),
+        useLocForKernelName(useLocForKernelName),
+        kernelSourceDir(kernelSourceDir),
+        deviceAddressValidation(deviceAddressValidation),
+        blockingCQ(blockingCQ) {}
+};
+
+inline std::ostream &operator<<(std::ostream &os, const Env &env) {
+  os << "debug::Env{\n"
+     << "\t"
+     << "dumpKernels: " << env.dumpKernels << "\n"
+     << "\t"
+     << "loadKernels: " << env.loadKernels << "\n"
+     << "\t"
+     << "useLocForKernelName: " << env.useLocForKernelName << "\n"
+     << "\t"
+     << "kernelSourceDir: " << env.kernelSourceDir << "\n"
+     << "\t"
+     << "deviceAddressValidation: " << env.deviceAddressValidation << "\n"
+     << "\t"
+     << "blockingCQ: " << env.blockingCQ << "\n"
+     << "}";
+  return os;
+}
+
+struct Hooks {
+  using OperationCallbackFn =
+      std::function<void(Binary, CallbackContext, OpContext)>;
+  using ProgramCallbackFn = std::function<void(Binary, CallbackContext)>;
+#if defined(TT_RUNTIME_DEBUG) && TT_RUNTIME_DEBUG == 1
+  static const Hooks &
+  get(std::optional<OperationCallbackFn> preOperatorCallback = std::nullopt,
+      std::optional<OperationCallbackFn> postOperatorCallback = std::nullopt,
+      std::optional<ProgramCallbackFn> preProgramCallback = std::nullopt,
+      std::optional<ProgramCallbackFn> postProgramCallback = std::nullopt);
+#else
+  constexpr static Hooks get() { return Hooks(); }
+#endif
+
+  const std::optional<OperationCallbackFn> &getPreOperatorCallback() const {
+#if defined(TT_RUNTIME_DEBUG) && TT_RUNTIME_DEBUG == 1
+    return preOperatorCallback;
+#else
+    static const std::optional<OperationCallbackFn> empty = std::nullopt;
+    return empty;
+#endif
+  }
+
+  const std::optional<OperationCallbackFn> &getPostOperatorCallback() const {
+#if defined(TT_RUNTIME_DEBUG) && TT_RUNTIME_DEBUG == 1
+    return postOperatorCallback;
+#else
+    static const std::optional<OperationCallbackFn> empty = std::nullopt;
+    return empty;
+#endif
+  }
+
+  const std::optional<ProgramCallbackFn> &getpreProgramCallback() const {
+#if defined(TT_RUNTIME_DEBUG) && TT_RUNTIME_DEBUG == 1
+    return preProgramCallback;
+#else
+    static const std::optional<ProgramCallbackFn> empty = std::nullopt;
+    return empty;
+#endif
+  }
+
+  const std::optional<ProgramCallbackFn> &getpostProgramCallback() const {
+#if defined(TT_RUNTIME_DEBUG) && TT_RUNTIME_DEBUG == 1
+    return postProgramCallback;
+#else
+    static const std::optional<ProgramCallbackFn> empty = std::nullopt;
+    return empty;
+#endif
+  }
+
+  void unregisterHooks() const {
+#if defined(TT_RUNTIME_DEBUG) && TT_RUNTIME_DEBUG == 1
+    preOperatorCallback = std::nullopt;
+    postOperatorCallback = std::nullopt;
+    preProgramCallback = std::nullopt;
+    postProgramCallback = std::nullopt;
+#endif
+  }
+
+private:
+#if defined(TT_RUNTIME_DEBUG) && TT_RUNTIME_DEBUG == 1
+  Hooks(const std::optional<OperationCallbackFn> &preOperatorCallback,
+        const std::optional<OperationCallbackFn> &postOperatorCallback,
+        const std::optional<ProgramCallbackFn> &preProgramCallback,
+        const std::optional<ProgramCallbackFn> &postProgramCallback)
+      : preOperatorCallback(preOperatorCallback),
+        postOperatorCallback(postOperatorCallback),
+        preProgramCallback(preProgramCallback),
+        postProgramCallback(postProgramCallback) {}
+
+  mutable std::optional<OperationCallbackFn> preOperatorCallback;
+  mutable std::optional<OperationCallbackFn> postOperatorCallback;
+  mutable std::optional<ProgramCallbackFn> preProgramCallback;
+  mutable std::optional<ProgramCallbackFn> postProgramCallback;
+
+#else
+  constexpr Hooks() = default;
+#endif
+};
+
+inline std::ostream &operator<<(std::ostream &os, const Hooks &hooks) {
+  os << "debug::Hooks{\n"
+     << "\t"
+     << "preOperatorCallback: "
+     << static_cast<bool>(hooks.getPreOperatorCallback()) << ",\n"
+     << "\t"
+     << "postOperatorCallback: "
+     << static_cast<bool>(hooks.getPostOperatorCallback()) << ",\n"
+     << "\t"
+     << "preProgramCallback: "
+     << static_cast<bool>(hooks.getpreProgramCallback()) << ",\n"
+     << "\t"
+     << "postProgramCallback: "
+     << static_cast<bool>(hooks.getpostProgramCallback()) << "\n"
+     << "}";
+  return os;
+}
+
+struct Stats {
+public:
+  Stats(const Stats &) = delete;
+  Stats &operator=(const Stats &) = delete;
+
+  Stats(Stats &&) = delete;
+  Stats &operator=(Stats &&) = delete;
+
+#if defined(TT_RUNTIME_DEBUG) && TT_RUNTIME_DEBUG == 1
+  static Stats &get();
+  void incrementStat(const std::string &stat, std::int64_t value = 1);
+  std::int64_t getStat(const std::string &stat) const;
+  void removeStat(const std::string &stat);
+  void clear();
+  std::string toString() const;
+#else
+  static constexpr Stats get() { return Stats(); }
+  inline void incrementStat(const std::string &, std::int64_t = 1) const {}
+  inline std::int64_t getStat(const std::string &) const { return 0; }
+  inline void removeStat(const std::string &) const {}
+  constexpr void clear() const {}
+  inline std::string toString() const { return "DebugStats Disabled"; }
+#endif
+
+private:
+#if defined(TT_RUNTIME_DEBUG) && TT_RUNTIME_DEBUG == 1
+  Stats() = default;
+  mutable std::shared_mutex countersMutex;
+  std::unordered_map<std::string, std::int64_t> counters;
+#else
+  constexpr Stats() = default;
+#endif
+};
+
+inline std::ostream &operator<<(std::ostream &os, const Stats &stats) {
+  os << stats.toString();
+  return os;
+}
+
+template <typename Func>
+void verifyFlatbuffer(const ::flatbuffers::FlatBufferBuilder &fbb,
+                      const Func &verifierFn) {
+#if defined(TT_RUNTIME_DEBUG) && TT_RUNTIME_DEBUG == 1
+  ::flatbuffers::Verifier verifier(fbb.GetBufferPointer(), fbb.GetSize());
+  bool valid = verifierFn(verifier);
+  assert(valid && "Failed to verify flatbuffer");
+#endif
+}
+
+#undef RUNTIME_DEBUG_MAYBE_INLINE
+
+} // namespace tt::runtime::debug
+
+#endif // TT_RUNTIME_DEBUG_H

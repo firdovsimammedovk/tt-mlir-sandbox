@@ -1,0 +1,50 @@
+add_mlir_dialect_library(MLIRStableHLOTransforms
+  AnalyzeMesh.cpp
+  AnnotateLocalShapes.cpp
+  ApplyArgumentShardStatus.cpp
+  AutoSharding.cpp
+  ComplexDataTypeConversion.cpp
+  ConvertXlaSdyToSdy.cpp
+  DecomposeCustomCallTuples.cpp
+  DecoupleConstFanout.cpp
+  FlattenOrConvertComposites.cpp
+  FuseDistributedCustomCalls.cpp
+  InsertReshardsForUnpropagatedOps.cpp
+  PartiallyConvertSdyToStableHLO.cpp
+  RegisterCustomShardingRule.cpp
+  ReoutlineComposite.cpp
+  ReplicateNonSplittableConstants.cpp
+  ShardyCCLCanonicalization.cpp
+  ShardyCCLToStableHLOCCLPatterns.cpp
+  StableHLOFusing.cpp
+  UnsolvedGraphPasses.cpp
+  UpdateGlobalToLocalShapes.cpp
+  WrapUnderManualComputation.cpp
+
+  ADDITIONAL_HEADER_DIRS
+  ${PROJECT_SOURCE_DIR}/include/ttmlir
+  ${TTMLIR_TOOLCHAIN_DIR}/src/shardy
+
+  LINK_LIBS PUBLIC
+  TTMLIRStableHLOUtils
+  MLIRFuncDialect
+  MLIRFuncTransforms
+  SdyDialect
+  SdyRegister
+  SdyTransformsPropagationOpShardingRuleBuilder
+  SdyTransformsPropagationPasses
+  SdyTransformsPropagationOpShardingRuleRegistry
+  SdyTransformsPropagationShardingGroupMap
+  SdyTransformsPropagationShardingProjection
+  SdyTransformsPropagationAutoPartitionerRegistry
+  SdyTransformsPropagationUtils
+  SdyTransformsPropagationBasicFactorPropagation
+  SdyTransformsPropagationAggressiveFactorPropagation
+  SdyTransformsCommonOpProperties
+  SdyTransformsCommonShardingWalker
+  SdyTransformsPropagationDebuggingSourceSharding
+  SdyCommonFileUtils
+  SdyTransformsExportPasses
+  SdyTransformsImportPasses
+  SdyTransformsPasses
+)

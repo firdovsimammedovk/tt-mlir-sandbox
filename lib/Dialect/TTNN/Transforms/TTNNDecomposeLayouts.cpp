@@ -1,0 +1,1286 @@
+// SPDX-FileCopyrightText: (c) 2024 Tenstorrent AI ULC
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#include "ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h"
+#include "ttmlir/Dialect/TTCore/IR/Utils.h"
+#include "ttmlir/Dialect/TTNN/IR/TTNNOps.h"
+#include "ttmlir/Dialect/TTNN/IR/TTNNOpsAttrs.h"
+#include "ttmlir/Dialect/TTNN/Transforms/Passes.h"
+#include "ttmlir/Dialect/TTNN/Types/Types.h"
+#include "ttmlir/Dialect/TTNN/Utils/TransformUtils.h"
+#include "ttmlir/Dialect/TTNN/Utils/Utils.h"
+#include "ttmlir/Support/Logger.h"
+
+#include "llvm/Support/MathExtras.h"
+#include "llvm/Support/raw_ostream.h"
+
+#include <cassert>
+
+namespace mlir::tt::ttnn {
+#define GEN_PASS_DEF_TTNNDECOMPOSELAYOUTS
+#include "ttmlir/Dialect/TTNN/Transforms/Passes.h.inc"
+
+class TTNNDecomposeLayouts
+    : public impl::TTNNDecomposeLayoutsBase<TTNNDecomposeLayouts> {
+
+public:
+  using impl::TTNNDecomposeLayoutsBase<
+      TTNNDecomposeLayouts>::TTNNDecomposeLayoutsBase;
+
+  void runOnOperation() final {
+    ModuleOp module = getOperation();
+    IRRewriter rewriter(&getContext());
+    llvm::SmallVector<Operation *> opsToReplace;
+    module->walk([&](func::FuncOp func) {
+      if (func.isDeclaration()) {
+        return;
+      }
+      assert(func.getBody().hasOneBlock() &&
+             "Found func that didn't have one block!");
+      func->walk([&](Operation *op) {
+        if (!isa<ttnn::ToLayoutOp>(op)) {
+          return;
+        }
+        opsToReplace.push_back(op);
+      });
+    });
+    for (Operation *op : opsToReplace) {
+      if (failed(createLayoutConversionOps(mlir::cast<ttnn::ToLayoutOp>(op),
+                                           rewriter))) {
+        signalPassFailure();
+        return;
+      }
+      rewriter.eraseOp(op);
+    }
+  }
+
+private:
+  struct LayoutInfo {
+    ttnn::BufferType bufferType;
+    ttnn::Layout layoutEnum;
+    ttcore::DataType dataType;
+    ttnn::TensorMemoryLayoutAttr tensorMemoryLayout;
+    llvm::SmallVector<int64_t> gridShape;
+    ttnn::CoreRangeSetAttr coreRangeSet;
+
+    bool isSharded() const {
+      return tensorMemoryLayout &&
+             isShardedMemoryLayout(tensorMemoryLayout.getValue());
+    }
+    bool isL1Sharded() const {
+      return bufferType == ttnn::BufferType::L1 && isSharded();
+    }
+    bool isDramSharded() const {
+      return bufferType == ttnn::BufferType::DRAM && isSharded();
+    }
+    bool isOnHost() const {
+      return bufferType == ttnn::BufferType::SystemMemory;
+    }
+    bool isOnDevice() const { return !isOnHost(); }
+    bool isTilized() const { return layoutEnum == ttnn::Layout::Tile; }
+  };
+
+  struct OpsToCreate {
+    bool createToDeviceOp = false;
+    bool createFromDeviceOp = false;
+    bool createToLayoutOp = false;
+    bool createDataTypeCastOp = false;
+    bool createToMemoryConfigOp = false;
+
+    bool createSomeOp() const {
+      return createToLayoutOp || createDataTypeCastOp || createToDeviceOp ||
+             createFromDeviceOp || createToMemoryConfigOp;
+    }
+
+    friend llvm::raw_ostream &operator<<(llvm::raw_ostream &os,
+                                         const OpsToCreate opsToCreate) {
+      os << "OpsToCreate{ \n"
+         << "\t"
+         << "CreateToDeviceOp: " << opsToCreate.createToDeviceOp << "\n"
+         << "\t"
+         << "CreateFromDeviceOp: " << opsToCreate.createFromDeviceOp << "\n"
+         << "\t"
+         << "CreateToLayoutOp: " << opsToCreate.createToLayoutOp << "\n"
+         << "\t"
+         << "CreateTypecastOp: " << opsToCreate.createDataTypeCastOp << "\n"
+         << "\t"
+         << "CreateToMemoryConfigOp: " << opsToCreate.createToMemoryConfigOp
+         << "\n}\n";
+      return os;
+    }
+  };
+
+  struct OpCreationInfo {
+    LayoutInfo input;
+    LayoutInfo output;
+    OpsToCreate opsToCreate;
+
+    OpCreationInfo(const LayoutInfo &input, const LayoutInfo &output,
+                   const OpsToCreate &opsToCreate)
+        : input(input), output(output), opsToCreate(opsToCreate) {}
+
+    bool shouldUntilize() const {
+      return opsToCreate.createToLayoutOp && !output.isTilized();
+    }
+
+    bool shouldTilize() const {
+      return opsToCreate.createToLayoutOp && output.isTilized();
+    }
+  };
+
+  bool isOutputFromCPUHoistedFunction(mlir::Value value) const {
+    if (auto callOp = value.getDefiningOp<func::CallOp>()) {
+      return callOp->hasAttr(ttmlir::utils::g_cpuHoistFuncCallAttrName);
+    }
+    return false;
+  }
+
+  bool isInputToCPUHoistedFunction(ttnn::ToLayoutOp op) const {
+    if (!op.getResult().hasOneUse()) {
+      return false;
+    }
+    if (auto callOp =
+            dyn_cast<func::CallOp>(*op.getResult().getUsers().begin())) {
+      return callOp->hasAttr(ttmlir::utils::g_cpuHoistFuncCallAttrName);
+    }
+    return false;
+  }
+
+  bool canTilizeDataTypeOnDevice(const ttcore::DataType &dataType) const {
+    // tt-metal tilize supports: bfloat16, float32, uint32, int32, uint16
+    // See: ttnn/operations/data_movement/tilize/device/tilize_op.cpp
+    return dataType == ttcore::DataType::BFloat16 ||
+           dataType == ttcore::DataType::Float32 ||
+           dataType == ttcore::DataType::UInt32 ||
+           dataType == ttcore::DataType::UInt16 ||
+           dataType == ttcore::DataType::Int32;
+  }
+
+  bool canUntilizeDataTypeOnDevice(const ttcore::DataType &dataType) const {
+    // tt-metal untilize supports: bfloat16, float32, uint32, int32, uint16.
+    // (requires use_pack_untilize for uint32/int32)
+    // See: ttnn/operations/data_movement/untilize/device/untilize_op.cpp
+    return dataType == ttcore::DataType::BFloat16 ||
+           dataType == ttcore::DataType::Float32 ||
+           dataType == ttcore::DataType::UInt32 ||
+           dataType == ttcore::DataType::UInt16 ||
+           dataType == ttcore::DataType::Int32;
+  }
+
+  std::pair<LayoutInfo, LayoutInfo>
+  getInputOutputLayouts(ttnn::ToLayoutOp op) const {
+    LayoutInfo input, output;
+
+    auto inputLayoutAttr =
+        mlir::cast<TTNNLayoutAttr>(op.getInput().getType().getEncoding());
+
+    auto outputLayoutAttr =
+        mlir::cast<TTNNLayoutAttr>(op.getResult().getType().getEncoding());
+
+    input.bufferType = inputLayoutAttr.getBufferType();
+    output.bufferType = outputLayoutAttr.getBufferType();
+
+    input.layoutEnum = inputLayoutAttr.getLayout();
+    output.layoutEnum = outputLayoutAttr.getLayout();
+
+    input.dataType = inputLayoutAttr.getDataType();
+    output.dataType = outputLayoutAttr.getDataType();
+
+    input.tensorMemoryLayout = inputLayoutAttr.getMemLayout();
+    output.tensorMemoryLayout = outputLayoutAttr.getMemLayout();
+
+    input.gridShape =
+        llvm::SmallVector<int64_t>(inputLayoutAttr.getGridShape());
+    output.gridShape =
+        llvm::SmallVector<int64_t>(outputLayoutAttr.getGridShape());
+
+    input.coreRangeSet = inputLayoutAttr.getCoreRangeSet();
+    output.coreRangeSet = outputLayoutAttr.getCoreRangeSet();
+
+    TTMLIR_DEBUG(ttmlir::LogComponent::General,
+                 "Decompose layouts pass for op {} \nInput layout: {} \nOutput "
+                 "layout: {} \n",
+                 op, inputLayoutAttr, outputLayoutAttr);
+
+    return {input, output};
+  }
+
+  OpsToCreate determineRequiredOps(const LayoutInfo &input,
+                                   const LayoutInfo &output) const {
+    OpsToCreate opsToCreate;
+
+    opsToCreate.createToDeviceOp =
+        (input.bufferType != output.bufferType) && input.isOnHost();
+    opsToCreate.createFromDeviceOp =
+        (input.bufferType != output.bufferType) && output.isOnHost();
+
+    opsToCreate.createDataTypeCastOp = input.dataType != output.dataType;
+    opsToCreate.createToLayoutOp = input.layoutEnum != output.layoutEnum;
+
+    // ToDeviceOp can handle the creation of the memory config of the initial
+    // device tensor
+    if (!opsToCreate.createToDeviceOp && output.isOnDevice()) {
+      opsToCreate.createToMemoryConfigOp =
+          output.tensorMemoryLayout &&
+          (input.tensorMemoryLayout != output.tensorMemoryLayout);
+      opsToCreate.createToMemoryConfigOp |=
+          (input.bufferType == ttnn::BufferType::DRAM &&
+           output.bufferType == ttnn::BufferType::L1) ||
+          (input.bufferType == ttnn::BufferType::L1 &&
+           output.bufferType == ttnn::BufferType::DRAM);
+      // Reshard if either the virtual grid or the physical placement (CRS)
+      // changes. Same CRS can host different virtual grids (e.g. BlockSharded
+      // {2,4} vs {4,2} on the same 8-core rectangle), and same gridShape can
+      // sit on different CRSes (custom placement) — both demand a reshard.
+      // Applies to both L1 <-> L1 and DRAM <-> DRAM resharding.
+      opsToCreate.createToMemoryConfigOp |=
+          (input.isSharded() && output.isSharded() &&
+           (input.gridShape != output.gridShape ||
+            input.coreRangeSet != output.coreRangeSet));
+    }
+
+    TTMLIR_DEBUG(ttmlir::LogComponent::General,
+                 "Decompose layouts pass ops to create: {}", opsToCreate);
+    return opsToCreate;
+  }
+
+  bool isCreationValid(ttnn::ToLayoutOp op, const LayoutInfo &input,
+                       const LayoutInfo &output,
+                       const OpsToCreate &opsToCreate) const {
+
+    if (!opsToCreate.createSomeOp()) {
+      op->emitError(
+          "Redundant ttnn::ToLayoutOp - no ttnn layout ops "
+          "needed, this may be due to the forcing of tile/row major layouts.");
+      return false;
+    }
+
+    if (opsToCreate.createToDeviceOp && opsToCreate.createFromDeviceOp) {
+      op->emitError("Cannot create both ToDeviceOp and FromDeviceOp");
+      return false;
+    }
+
+    if (opsToCreate.createToMemoryConfigOp &&
+        output.bufferType == ttnn::BufferType::SystemMemory) {
+      op->emitError(
+          "ToMemoryConfigOp only supported for device output tensors");
+      return false;
+    }
+
+    if (input.isOnHost() && opsToCreate.createFromDeviceOp) {
+      op->emitError("Unexpected FromDeviceOp on host tensor");
+      return false;
+    }
+
+    if (input.isOnDevice() && opsToCreate.createToDeviceOp) {
+      op->emitError("Unexpected ToDeviceOp on device tensor");
+      return false;
+    }
+    return true;
+  }
+
+  /* Helper functions to create ttnn layout ops */
+
+  template <typename OpType, typename... Args>
+  mlir::Value createOp(ttnn::ToLayoutOp op, IRRewriter &rewriter,
+                       mlir::Value currentInput, Args &&...args) const {
+
+    rewriter.setInsertionPoint(op);
+    return rewriter.create<OpType>(op.getLoc(), op.getType(), currentInput,
+                                   std::forward<Args>(args)...);
+  }
+
+  template <typename OpType, typename... Args>
+  mlir::Value createOp(IRRewriter &rewriter, ttnn::ToLayoutOp op,
+                       RankedTensorType newResultType, mlir::Value currentInput,
+                       Args &&...args) const {
+    rewriter.setInsertionPoint(op);
+    return rewriter.create<OpType>(op.getLoc(), newResultType, currentInput,
+                                   std::forward<Args>(args)...);
+  }
+
+  mlir::Value createToDeviceOpIfNeeded(ttnn::ToLayoutOp op,
+                                       IRRewriter &rewriter,
+                                       mlir::Value currentInput,
+                                       const OpCreationInfo &info,
+                                       bool forceCreate = false) const {
+    if (!info.opsToCreate.createToDeviceOp && !forceCreate) {
+      return currentInput;
+    }
+    RankedTensorType currentInputType =
+        mlir::cast<RankedTensorType>(currentInput.getType());
+
+    TTNNLayoutAttr newEncoding =
+        TTNNLayoutAttr::Builder(currentInputType)
+            .setBufferType(info.output.bufferType)
+            .setMemoryLayout(info.output.tensorMemoryLayout)
+            .setGridShape(info.output.gridShape)
+            .setCoreRangeSet(info.output.coreRangeSet)
+            .build();
+    RankedTensorType newResultType =
+        utils::RankedTensorTypeFactory::create(currentInputType, newEncoding);
+
+    mlir::Value device = utils::getOrInsertDevice(rewriter, op);
+
+    // Create new ranked tensor type with host memory buffer type
+    return this->createOp<ttnn::ToDeviceOp>(rewriter, op, newResultType,
+                                            currentInput, device);
+  }
+
+  // FromDeviceOp
+  mlir::Value createFromDeviceOpIfNeeded(ttnn::ToLayoutOp op,
+                                         IRRewriter &rewriter,
+                                         mlir::Value currentInput,
+                                         const OpCreationInfo &info,
+                                         bool forceCreate = false) const {
+    if (!info.opsToCreate.createFromDeviceOp && !forceCreate) {
+      return currentInput;
+    }
+    RankedTensorType currentInputType =
+        mlir::cast<RankedTensorType>(currentInput.getType());
+    RankedTensorType newResultType = utils::RankedTensorTypeFactory::create(
+        currentInputType, ttnn::BufferType::SystemMemory);
+    return this->createOp<ttnn::FromDeviceOp>(rewriter, op, newResultType,
+                                              currentInput);
+  }
+
+  mlir::Value createToLayoutOpIfNeeded(ttnn::ToLayoutOp op,
+                                       IRRewriter &rewriter,
+                                       mlir::Value currentInput,
+                                       const OpCreationInfo &info) const {
+    if (!info.opsToCreate.createToLayoutOp) {
+      return currentInput;
+    }
+    RankedTensorType newResultType = utils::RankedTensorTypeFactory::create(
+        mlir::cast<RankedTensorType>(currentInput.getType()),
+        info.output.layoutEnum);
+
+    return this->createOp<ttnn::ToLayoutOp>(rewriter, op, newResultType,
+                                            currentInput);
+  }
+
+  mlir::Value createDataTypeCastingOp(ttnn::ToLayoutOp op, IRRewriter &rewriter,
+                                      mlir::Value currentInput,
+                                      const OpCreationInfo &info) const {
+    RankedTensorType newResultType = utils::RankedTensorTypeFactory::create(
+        mlir::cast<RankedTensorType>(currentInput.getType()),
+        info.output.dataType);
+    return this->createOp<ttnn::TypecastOp>(rewriter, op, newResultType,
+                                            currentInput);
+  }
+
+  mlir::Value
+  createDataTypeCastingOpIfNeeded(ttnn::ToLayoutOp op, IRRewriter &rewriter,
+                                  mlir::Value currentInput,
+                                  const OpCreationInfo &info) const {
+    if (!info.opsToCreate.createDataTypeCastOp) {
+      return currentInput;
+    }
+    return this->createDataTypeCastingOp(op, rewriter, currentInput, info);
+  }
+
+  mlir::Value createToMemoryConfigOpIfNeeded(ttnn::ToLayoutOp op,
+                                             IRRewriter &rewriter,
+                                             mlir::Value currentInput,
+                                             const OpCreationInfo &info,
+                                             bool forceCreate = false) const {
+    if (!info.opsToCreate.createToMemoryConfigOp && !forceCreate) {
+      return currentInput;
+    }
+    RankedTensorType currentInputType =
+        mlir::cast<RankedTensorType>(currentInput.getType());
+    TTNNLayoutAttr currentLayout =
+        utils::getLayoutAttrFromTensor(currentInputType);
+
+    // Skip if the current input is already interleaved in the target buffer
+    // type. This can happen when a forced createToDeviceOp already placed
+    // the tensor in the correct memory config — the precomputed
+    // createToMemoryConfigOp flag doesn't account for intermediate ops.
+    // For interleaved tensors the only remaining difference would be the
+    // physical encoding shape (memref), which has no runtime effect.
+    // We only skip for interleaved because sharded tensors may need a
+    // reshard (different shard grid) even with matching buffer type and
+    // memory layout.
+    if (currentLayout.getBufferType() == info.output.bufferType &&
+        currentLayout.getMemLayout() == info.output.tensorMemoryLayout &&
+        currentLayout.getMemLayout().getValue() ==
+            TensorMemoryLayout::Interleaved) {
+      return currentInput;
+    }
+
+    ttcore::DataType dataType = currentLayout.getDataType();
+
+    // ttnn.copy (used internally by to_memory_config) does not support uint16.
+    // Cast to uint32 first, perform the memory config change, then cast back.
+    // Metal issue reference:
+    // https://github.com/tenstorrent/tt-metal/issues/41689
+    bool needsWorkaround = dataType == ttcore::DataType::UInt16;
+    if (needsWorkaround) {
+      ttcore::DataType workaroundDtype = ttcore::DataType::UInt32;
+      RankedTensorType workaroundType = utils::RankedTensorTypeFactory::create(
+          currentInputType, workaroundDtype);
+      currentInput = this->createOp<ttnn::TypecastOp>(
+          rewriter, op, workaroundType, currentInput);
+      currentInputType = mlir::cast<RankedTensorType>(currentInput.getType());
+    }
+
+    TTNNLayoutAttr newLayout =
+        TTNNLayoutAttr::Builder(currentInputType)
+            .setBufferType(info.output.bufferType)
+            .setMemoryLayout(info.output.tensorMemoryLayout)
+            .setGridShape(info.output.gridShape)
+            .setCoreRangeSet(info.output.coreRangeSet)
+            .build();
+    RankedTensorType newResultType =
+        utils::RankedTensorTypeFactory::create(currentInputType, newLayout);
+    mlir::Value result = this->createOp<ttnn::ToMemoryConfigOp>(
+        rewriter, op, newResultType, currentInput);
+
+    if (needsWorkaround) {
+      RankedTensorType origType = utils::RankedTensorTypeFactory::create(
+          mlir::cast<RankedTensorType>(result.getType()), dataType);
+      result = this->createOp<ttnn::TypecastOp>(rewriter, op, origType, result);
+    }
+
+    return result;
+  }
+
+  // Workaround for tt-metal#30541: ttnn.tilize does not support
+  // HEIGHT_SHARDED L1 tensors with non-tile-aligned shard shapes.
+  // Check whether the tilize pad workaround is needed.
+  bool needsShardedTilizePadWorkaround(ttnn::ToLayoutOp op,
+                                       const OpCreationInfo &info) const {
+    if (!info.input.isL1Sharded()) {
+      return false;
+    }
+    auto inputType = mlir::cast<RankedTensorType>(op.getInput().getType());
+    auto encoding = mlir::dyn_cast<TTNNLayoutAttr>(inputType.getEncoding());
+    if (!encoding) {
+      return false;
+    }
+    auto memLayout = encoding.getMemLayout();
+    if (!memLayout ||
+        memLayout.getValue() != TensorMemoryLayout::HeightSharded) {
+      return false;
+    }
+    ArrayRef<int64_t> shape = inputType.getShape();
+    int64_t rank = inputType.getRank();
+    if (rank < 2) {
+      return false;
+    }
+    return (shape[rank - 2] % TILE_HEIGHT != 0) ||
+           (shape[rank - 1] % TILE_WIDTH != 0);
+  }
+
+  // Workaround for tt-metal#30541: unshard → pad → tilize → slice.
+  // Returns a DRAM INTERLEAVED, tilized, original-shape tensor.
+  // The caller is responsible for typecast and final memory config (reshard).
+  mlir::Value handleShardedTilizeWithPadding(ttnn::ToLayoutOp op,
+                                             IRRewriter &rewriter,
+                                             mlir::Value currentInput,
+                                             const OpCreationInfo &info) const {
+    auto inputType = mlir::cast<RankedTensorType>(currentInput.getType());
+    TTNNLayoutAttr inputEncoding =
+        mlir::cast<TTNNLayoutAttr>(inputType.getEncoding());
+    ArrayRef<int64_t> shape = inputType.getShape();
+    int64_t rank = inputType.getRank();
+    ttcore::DataType dataType = inputEncoding.getDataType();
+
+    // Step 1: Unshard to DRAM INTERLEAVED.
+    // ttnn.copy (to_memory_config) doesn't support u16 (tt-metal#41689),
+    // so u16 tensors use a host round-trip (from_device → to_device).
+    TTNNLayoutAttr dramEncoding =
+        TTNNLayoutAttr::Builder(inputEncoding, shape)
+            .setBufferType(BufferType::DRAM)
+            .setMemoryLayout(TensorMemoryLayout::Interleaved)
+            .setGridShape({1, 1})
+            .build();
+    RankedTensorType dramType =
+        RankedTensorType::get(shape, inputType.getElementType(), dramEncoding);
+
+    rewriter.setInsertionPoint(op);
+
+    if (dataType == ttcore::DataType::UInt16) {
+      auto hostType = utils::RankedTensorTypeFactory::create(
+          inputType, BufferType::SystemMemory);
+      mlir::Value hostVal =
+          rewriter.create<FromDeviceOp>(op.getLoc(), hostType, currentInput);
+      mlir::Value device = utils::getOrInsertDevice(rewriter, op);
+      currentInput =
+          rewriter.create<ToDeviceOp>(op.getLoc(), dramType, hostVal, device);
+    } else {
+      currentInput = rewriter.create<ToMemoryConfigOp>(op.getLoc(), dramType,
+                                                       currentInput);
+    }
+
+    // Step 2: Pad to tile-aligned dimensions.
+    int64_t h = shape[rank - 2];
+    int64_t w = shape[rank - 1];
+    int64_t paddedH =
+        llvm::divideCeil(h, static_cast<int64_t>(TILE_HEIGHT)) * TILE_HEIGHT;
+    int64_t paddedW =
+        llvm::divideCeil(w, static_cast<int64_t>(TILE_WIDTH)) * TILE_WIDTH;
+
+    SmallVector<int64_t> paddedShape(shape);
+    paddedShape[rank - 2] = paddedH;
+    paddedShape[rank - 1] = paddedW;
+
+    SmallVector<int32_t> padding(rank * 2, 0);
+    if (h % TILE_HEIGHT != 0) {
+      padding[(rank - 2) * 2 + 1] = paddedH - h;
+    }
+    if (w % TILE_WIDTH != 0) {
+      padding[(rank - 1) * 2 + 1] = paddedW - w;
+    }
+
+    auto currentInputType =
+        mlir::cast<RankedTensorType>(currentInput.getType());
+    auto paddedType =
+        utils::RankedTensorTypeFactory::create(currentInputType, paddedShape);
+
+    currentInput = rewriter.create<PadOp>(
+        op.getLoc(), paddedType, currentInput,
+        rewriter.getDenseI32ArrayAttr(padding), rewriter.getF32FloatAttr(0.0f),
+        /*use_multicore=*/rewriter.getBoolAttr(true));
+
+    // Step 3: Tilize on padded DRAM tensor.
+    RankedTensorType paddedTiledType = utils::RankedTensorTypeFactory::create(
+        mlir::cast<RankedTensorType>(currentInput.getType()),
+        info.output.layoutEnum);
+    currentInput = rewriter.create<ttnn::ToLayoutOp>(
+        op.getLoc(), paddedTiledType, currentInput);
+
+    // Step 4: Slice back to original shape.
+    SmallVector<int32_t> begins(rank, 0);
+    SmallVector<int32_t> ends(shape.begin(), shape.end());
+    SmallVector<int32_t> steps(rank, 1);
+
+    RankedTensorType slicedType = utils::RankedTensorTypeFactory::create(
+        mlir::cast<RankedTensorType>(currentInput.getType()), shape);
+    currentInput = rewriter.create<SliceStaticOp>(
+        op.getLoc(), slicedType, currentInput, rewriter.getI32ArrayAttr(begins),
+        rewriter.getI32ArrayAttr(ends), rewriter.getI32ArrayAttr(steps));
+
+    return currentInput;
+  }
+
+  /* Functions that create ops based on the layouts of the input output tensors
+   */
+
+  void handleHostInputNoLayoutNoTypecast(ttnn::ToLayoutOp op,
+                                         IRRewriter &rewriter,
+                                         mlir::Value currentInput,
+                                         const OpCreationInfo &info) const {
+    // If the input tensor is on host and we don't need to create a ToLayoutOp
+    // nor a TypecastOp we can create a ToDeviceOp and a ToMemoryConfigOp if
+    // needed and return
+    currentInput =
+        this->createToDeviceOpIfNeeded(op, rewriter, currentInput, info);
+    currentInput =
+        this->createToMemoryConfigOpIfNeeded(op, rewriter, currentInput, info);
+    op.getResult().replaceAllUsesWith(currentInput);
+  }
+
+  void handleHostInputLayoutNoTypecast(ttnn::ToLayoutOp op,
+                                       IRRewriter &rewriter,
+                                       mlir::Value currentInput,
+                                       const OpCreationInfo &info) const {
+    const LayoutInfo &input = info.input;
+    const LayoutInfo &output = info.output;
+    assert(input.dataType == output.dataType &&
+           "Data type should be the same if we're not creating typecast op");
+
+    // If the output is on the host, we can perform layout conversion on host.
+    if (output.isOnHost()) {
+      currentInput =
+          this->createToLayoutOpIfNeeded(op, rewriter, currentInput, info);
+      currentInput = this->createToMemoryConfigOpIfNeeded(op, rewriter,
+                                                          currentInput, info);
+      op.getResult().replaceAllUsesWith(currentInput);
+      return;
+    }
+
+    // If the input value is an output from a CPU-hoisted function, we should
+    // perform layout change on host to minimize intermediate DRAM/L1 usage.
+    if (isOutputFromCPUHoistedFunction(currentInput)) {
+      currentInput =
+          this->createToLayoutOpIfNeeded(op, rewriter, currentInput, info);
+      currentInput =
+          this->createToDeviceOpIfNeeded(op, rewriter, currentInput, info);
+      currentInput = this->createToMemoryConfigOpIfNeeded(op, rewriter,
+                                                          currentInput, info);
+      op.getResult().replaceAllUsesWith(currentInput);
+      return;
+    }
+
+    // If the output is on device and we can untilize on device, move to device
+    // and untilize.
+    if (info.shouldUntilize() && canUntilizeDataTypeOnDevice(output.dataType)) {
+      currentInput =
+          this->createToDeviceOpIfNeeded(op, rewriter, currentInput, info);
+      currentInput =
+          this->createToLayoutOpIfNeeded(op, rewriter, currentInput, info);
+      currentInput = this->createToMemoryConfigOpIfNeeded(op, rewriter,
+                                                          currentInput, info);
+      op.getResult().replaceAllUsesWith(currentInput);
+      return;
+    }
+
+    // If the output is on device and we should untilize, we untilize on
+    // host and then move the tensor to device.
+    if (info.shouldUntilize() &&
+        !canUntilizeDataTypeOnDevice(output.dataType)) {
+      currentInput =
+          this->createToLayoutOpIfNeeded(op, rewriter, currentInput, info);
+      currentInput =
+          this->createToDeviceOpIfNeeded(op, rewriter, currentInput, info);
+      currentInput = this->createToMemoryConfigOpIfNeeded(op, rewriter,
+                                                          currentInput, info);
+      op.getResult().replaceAllUsesWith(currentInput);
+      return;
+    }
+
+    // If the tensor tilizable on device, we can move the tensor to device and
+    // perform the tilization on device.
+    if (info.shouldTilize() && canTilizeDataTypeOnDevice(output.dataType)) {
+      currentInput =
+          this->createToDeviceOpIfNeeded(op, rewriter, currentInput, info);
+      currentInput =
+          this->createToLayoutOpIfNeeded(op, rewriter, currentInput, info);
+      currentInput = this->createToMemoryConfigOpIfNeeded(op, rewriter,
+                                                          currentInput, info);
+      op.getResult().replaceAllUsesWith(currentInput);
+      return;
+    }
+
+    // Otherwise, if tensor is not in a tilizable data format, we perform
+    // tilizing on host and than move the tensor to device.
+    if (info.shouldTilize() && !canTilizeDataTypeOnDevice(output.dataType)) {
+      currentInput =
+          this->createToLayoutOpIfNeeded(op, rewriter, currentInput, info);
+      currentInput =
+          this->createToDeviceOpIfNeeded(op, rewriter, currentInput, info);
+      currentInput = this->createToMemoryConfigOpIfNeeded(op, rewriter,
+                                                          currentInput, info);
+      op.getResult().replaceAllUsesWith(currentInput);
+      return;
+    }
+
+    llvm_unreachable("Unreachable code path");
+  }
+
+  void handleHostInputNoLayoutTypecast(ttnn::ToLayoutOp op,
+                                       IRRewriter &rewriter,
+                                       mlir::Value currentInput,
+                                       const OpCreationInfo &info) const {
+    const LayoutInfo &input = info.input;
+    const LayoutInfo &output = info.output;
+    assert(input.layoutEnum == output.layoutEnum &&
+           "Layout should be the same if we're not creating a ToLayoutOp");
+
+    // If the output is on the host, we can perform the data type cast directly
+    // on the host.
+    if (output.isOnHost()) {
+      currentInput = this->createDataTypeCastingOpIfNeeded(op, rewriter,
+                                                           currentInput, info);
+      currentInput = this->createToMemoryConfigOpIfNeeded(op, rewriter,
+                                                          currentInput, info);
+      op.getResult().replaceAllUsesWith(currentInput);
+      return;
+    }
+
+    // If the input value is an output from a CPU-hoisted function, we should
+    // perform typecast on host to minimize intermediate DRAM/L1 usage.
+    if (isOutputFromCPUHoistedFunction(currentInput)) {
+      currentInput = this->createDataTypeCastingOpIfNeeded(op, rewriter,
+                                                           currentInput, info);
+      currentInput =
+          this->createToDeviceOpIfNeeded(op, rewriter, currentInput, info);
+      currentInput = this->createToMemoryConfigOpIfNeeded(op, rewriter,
+                                                          currentInput, info);
+      op.getResult().replaceAllUsesWith(currentInput);
+      return;
+    }
+
+    // Device typecast only supports tilized tensors. Therefore, if the output
+    // tensor is in row-major (input as well is in row-major) and resides on the
+    // device, we should perform the data type casting on the host before moving
+    // the tensor back to the device.
+    if (!output.isTilized()) {
+      currentInput = this->createDataTypeCastingOpIfNeeded(op, rewriter,
+                                                           currentInput, info);
+      currentInput =
+          this->createToDeviceOpIfNeeded(op, rewriter, currentInput, info);
+      currentInput = this->createToMemoryConfigOpIfNeeded(op, rewriter,
+                                                          currentInput, info);
+      op.getResult().replaceAllUsesWith(currentInput);
+      return;
+    }
+
+    // If the output tensor is tilized and resides on the device, we can move
+    // the tensor to the device and perform the data type cast directly on the
+    // device.
+    if (output.isTilized()) {
+      currentInput =
+          this->createToDeviceOpIfNeeded(op, rewriter, currentInput, info);
+      currentInput = this->createDataTypeCastingOpIfNeeded(op, rewriter,
+                                                           currentInput, info);
+      currentInput = this->createToMemoryConfigOpIfNeeded(op, rewriter,
+                                                          currentInput, info);
+      op.getResult().replaceAllUsesWith(currentInput);
+      return;
+    }
+
+    llvm_unreachable("Unreachable code path");
+  }
+
+  void handleHostInputLayoutTypecast(ttnn::ToLayoutOp op, IRRewriter &rewriter,
+                                     mlir::Value currentInput,
+                                     const OpCreationInfo &info) const {
+    const LayoutInfo &input = info.input;
+    const LayoutInfo &output = info.output;
+
+    // If the output tensor is on host, we can perform the data type cast and
+    // layout conversion on host.
+    if (output.isOnHost()) {
+      currentInput = this->createDataTypeCastingOpIfNeeded(op, rewriter,
+                                                           currentInput, info);
+      currentInput =
+          this->createToLayoutOpIfNeeded(op, rewriter, currentInput, info);
+      currentInput = this->createToMemoryConfigOpIfNeeded(op, rewriter,
+                                                          currentInput, info);
+      op.getResult().replaceAllUsesWith(currentInput);
+      return;
+    }
+
+    // If the input value is an output from a CPU-hoisted function, we should
+    // perform both typecast and layout change on host to minimize
+    // intermediate DRAM/L1 usage.
+    if (isOutputFromCPUHoistedFunction(currentInput)) {
+      currentInput = this->createDataTypeCastingOpIfNeeded(op, rewriter,
+                                                           currentInput, info);
+      currentInput =
+          this->createToLayoutOpIfNeeded(op, rewriter, currentInput, info);
+      currentInput =
+          this->createToDeviceOpIfNeeded(op, rewriter, currentInput, info);
+      currentInput = this->createToMemoryConfigOpIfNeeded(op, rewriter,
+                                                          currentInput, info);
+      op.getResult().replaceAllUsesWith(currentInput);
+      return;
+    }
+
+    // If we can untilize on device, move to device if
+    // needed, perform the typecast first and then untilize
+    if (info.shouldUntilize() && canUntilizeDataTypeOnDevice(output.dataType)) {
+      currentInput =
+          this->createToDeviceOpIfNeeded(op, rewriter, currentInput, info);
+      currentInput = this->createDataTypeCastingOpIfNeeded(op, rewriter,
+                                                           currentInput, info);
+      currentInput =
+          this->createToLayoutOpIfNeeded(op, rewriter, currentInput, info);
+      currentInput = this->createToMemoryConfigOpIfNeeded(op, rewriter,
+                                                          currentInput, info);
+      op.getResult().replaceAllUsesWith(currentInput);
+      return;
+    }
+
+    // If we cannot untilize on device, untilize and typecast on host
+    if (info.shouldUntilize() &&
+        !canUntilizeDataTypeOnDevice(output.dataType)) {
+      currentInput = this->createDataTypeCastingOpIfNeeded(op, rewriter,
+                                                           currentInput, info);
+      currentInput =
+          this->createToLayoutOpIfNeeded(op, rewriter, currentInput, info);
+      currentInput =
+          this->createToDeviceOpIfNeeded(op, rewriter, currentInput, info);
+      currentInput = this->createToMemoryConfigOpIfNeeded(op, rewriter,
+                                                          currentInput, info);
+      op.getResult().replaceAllUsesWith(currentInput);
+      return;
+    }
+
+    // If we need to tilize and change the data type from a tilizable data
+    // format to another format, we can move the tensor to the device, perform
+    // the tilization, and then cast the data type on the device
+    if (info.shouldTilize() && canTilizeDataTypeOnDevice(input.dataType)) {
+      currentInput =
+          this->createToDeviceOpIfNeeded(op, rewriter, currentInput, info);
+      currentInput =
+          this->createToLayoutOpIfNeeded(op, rewriter, currentInput, info);
+      currentInput = this->createDataTypeCastingOpIfNeeded(op, rewriter,
+                                                           currentInput, info);
+      currentInput = this->createToMemoryConfigOpIfNeeded(op, rewriter,
+                                                          currentInput, info);
+      op.getResult().replaceAllUsesWith(currentInput);
+      return;
+    }
+
+    // If we need to tilize and change the data format from another format
+    // to a tilizable data format, we can cast the data type on host, move
+    // the tensor to device, and then tilize on device.
+    if (info.shouldTilize() && canTilizeDataTypeOnDevice(output.dataType)) {
+      currentInput = this->createDataTypeCastingOpIfNeeded(op, rewriter,
+                                                           currentInput, info);
+      currentInput =
+          this->createToDeviceOpIfNeeded(op, rewriter, currentInput, info);
+      currentInput =
+          this->createToLayoutOpIfNeeded(op, rewriter, currentInput, info);
+      currentInput = this->createToMemoryConfigOpIfNeeded(op, rewriter,
+                                                          currentInput, info);
+      op.getResult().replaceAllUsesWith(currentInput);
+      return;
+    }
+
+    // If we need to tilize and the input/output data types are not device
+    // tilizable do everything on host
+    if (info.shouldTilize() && !canTilizeDataTypeOnDevice(input.dataType) &&
+        !canTilizeDataTypeOnDevice(output.dataType)) {
+      currentInput = this->createDataTypeCastingOpIfNeeded(op, rewriter,
+                                                           currentInput, info);
+      currentInput =
+          this->createToLayoutOpIfNeeded(op, rewriter, currentInput, info);
+      currentInput =
+          this->createToDeviceOpIfNeeded(op, rewriter, currentInput, info);
+      currentInput = this->createToMemoryConfigOpIfNeeded(op, rewriter,
+                                                          currentInput, info);
+      op.getResult().replaceAllUsesWith(currentInput);
+      return;
+    }
+
+    llvm_unreachable("Unreachable code path");
+  }
+
+  void handleHostInputLayoutConversion(ttnn::ToLayoutOp op,
+                                       IRRewriter &rewriter,
+                                       mlir::Value currentInput,
+                                       const OpCreationInfo &info) const {
+    const OpsToCreate &opsToCreate = info.opsToCreate;
+    if (!opsToCreate.createToLayoutOp && !opsToCreate.createDataTypeCastOp) {
+      return handleHostInputNoLayoutNoTypecast(op, rewriter, currentInput,
+                                               info);
+    }
+    if (opsToCreate.createToLayoutOp && !opsToCreate.createDataTypeCastOp) {
+      return handleHostInputLayoutNoTypecast(op, rewriter, currentInput, info);
+    }
+    if (!opsToCreate.createToLayoutOp && opsToCreate.createDataTypeCastOp) {
+      return handleHostInputNoLayoutTypecast(op, rewriter, currentInput, info);
+    }
+    if (opsToCreate.createToLayoutOp && opsToCreate.createDataTypeCastOp) {
+      return handleHostInputLayoutTypecast(op, rewriter, currentInput, info);
+    }
+    llvm_unreachable("Unreachable code path");
+  }
+
+  void handleDeviceInputNoLayoutNoTypecast(ttnn::ToLayoutOp op,
+                                           IRRewriter &rewriter,
+                                           mlir::Value currentInput,
+                                           const OpCreationInfo &info) const {
+    // If the input tensor is on device and we don't need to create a ToLayoutOp
+    // nor a TypecastOp we can create a FromDeviceOp and a ToMemoryConfigOp if
+    // needed and return
+    currentInput =
+        this->createToMemoryConfigOpIfNeeded(op, rewriter, currentInput, info);
+    currentInput =
+        this->createFromDeviceOpIfNeeded(op, rewriter, currentInput, info);
+    op.getResult().replaceAllUsesWith(currentInput);
+  }
+
+  // Untilize a device tensor on-device (optionally typecasting first), then
+  // move it to host if needed. Shared by handleDeviceInputLayoutNoTypecast and
+  // handleDeviceInputLayoutTypecast.
+  //
+  // The memory-config change is ordered relative to the untilize based on the
+  // input placement:
+  //   - L1-sharded, or L1 -> DRAM: change memory config *before* untilizing.
+  //     ttnn::untilize does support sharded I/O, but only when the input shard
+  //     is tile-aligned and the (row-major) output shard row size is aligned
+  //     to the allocator alignment. A width-sharded tensor whose per-core
+  //     shard isn't tile-aligned (e.g. 268 elements over 9 cores -> 30/core)
+  //     yields a row-major output shard (1, 30) that satisfies neither:
+  //     ttnn::to_layout first FATALs building its TILE spec from that shard,
+  //     and even past that a 30xui32 (120B) row isn't 16B-aligned. Deshard to
+  //     the target memory config first, then untilize the interleaved tensor.
+  //     For L1 -> DRAM, moving while still tiled keeps the row-major
+  //     intermediate from clashing with live L1 buffers. (tt-xla #5118)
+  //   - otherwise: untilize first, then change memory config.
+  //
+  // createDataTypeCastingOpIfNeeded / createToMemoryConfigOpIfNeeded are no-ops
+  // when their op isn't required, so this is safe for the no-typecast caller.
+  void untilizeOnDeviceThenFromHost(ttnn::ToLayoutOp op, IRRewriter &rewriter,
+                                    mlir::Value currentInput,
+                                    const OpCreationInfo &info) const {
+    const LayoutInfo &input = info.input;
+    const LayoutInfo &output = info.output;
+    currentInput =
+        this->createDataTypeCastingOpIfNeeded(op, rewriter, currentInput, info);
+    if (input.isL1Sharded() || (input.bufferType == ttnn::BufferType::L1 &&
+                                output.bufferType == ttnn::BufferType::DRAM)) {
+      currentInput = this->createToMemoryConfigOpIfNeeded(op, rewriter,
+                                                          currentInput, info);
+      currentInput =
+          this->createToLayoutOpIfNeeded(op, rewriter, currentInput, info);
+    } else {
+      currentInput =
+          this->createToLayoutOpIfNeeded(op, rewriter, currentInput, info);
+      currentInput = this->createToMemoryConfigOpIfNeeded(op, rewriter,
+                                                          currentInput, info);
+    }
+    currentInput =
+        this->createFromDeviceOpIfNeeded(op, rewriter, currentInput, info);
+    op.getResult().replaceAllUsesWith(currentInput);
+  }
+
+  void handleDeviceInputLayoutNoTypecast(ttnn::ToLayoutOp op,
+                                         IRRewriter &rewriter,
+                                         mlir::Value currentInput,
+                                         const OpCreationInfo &info) const {
+    const LayoutInfo &input = info.input;
+    const LayoutInfo &output = info.output;
+    const OpsToCreate &opsToCreate = info.opsToCreate;
+    assert(input.dataType == output.dataType &&
+           "Data type should be the same if we're not creating typecast op");
+
+    // If the result feeds into a CPU-hoisted function, we should move to host
+    // first and perform layout change on host to minimize intermediate DRAM/L1
+    // usage.
+    if (isInputToCPUHoistedFunction(op)) {
+      currentInput =
+          this->createFromDeviceOpIfNeeded(op, rewriter, currentInput, info);
+      currentInput =
+          this->createToLayoutOpIfNeeded(op, rewriter, currentInput, info);
+      currentInput = this->createToMemoryConfigOpIfNeeded(op, rewriter,
+                                                          currentInput, info);
+      op.getResult().replaceAllUsesWith(currentInput);
+      return;
+    }
+
+    // If we can untilize on device, untilize on device then move to host.
+    if (info.shouldUntilize() && canUntilizeDataTypeOnDevice(input.dataType)) {
+      untilizeOnDeviceThenFromHost(op, rewriter, currentInput, info);
+      return;
+    }
+
+    // If we want to untilize, but we cannot untilize on
+    // device, move to host and then untilize
+    if (info.shouldUntilize() && !canUntilizeDataTypeOnDevice(input.dataType) &&
+        opsToCreate.createFromDeviceOp) {
+      currentInput =
+          this->createFromDeviceOpIfNeeded(op, rewriter, currentInput, info);
+      currentInput =
+          this->createToLayoutOpIfNeeded(op, rewriter, currentInput, info);
+      op.getResult().replaceAllUsesWith(currentInput);
+      return;
+    }
+
+    // This is a rare untilize case, where we want to untilize a device tensor
+    // but keep it on device. To handle this we need to move the tensor to host,
+    // untilize it, and then move it back to device
+    if (info.shouldUntilize() && !canUntilizeDataTypeOnDevice(input.dataType) &&
+        !opsToCreate.createFromDeviceOp) {
+      // Force-create a FromDeviceOp
+      currentInput = this->createFromDeviceOpIfNeeded(
+          op, rewriter, currentInput, info, /*forceCreate=*/true);
+      // untilize on host
+      currentInput =
+          this->createToLayoutOpIfNeeded(op, rewriter, currentInput, info);
+      // move back to device and convert memory config if needed
+      currentInput = createToDeviceOpIfNeeded(op, rewriter, currentInput, info,
+                                              /*forceCreate=*/true);
+      op.getResult().replaceAllUsesWith(currentInput);
+      return;
+    }
+
+    // If we should tilize and the input data type is device-tilizable, tilize
+    // on device
+    if (info.shouldTilize() && canTilizeDataTypeOnDevice(input.dataType)) {
+      if (needsShardedTilizePadWorkaround(op, info)) {
+        // tt-metal#30541: unshard → pad → tilize → slice, then force reshard.
+        currentInput =
+            handleShardedTilizeWithPadding(op, rewriter, currentInput, info);
+        currentInput = this->createToMemoryConfigOpIfNeeded(
+            op, rewriter, currentInput, info, /*forceCreate=*/true);
+      } else {
+        currentInput =
+            this->createToLayoutOpIfNeeded(op, rewriter, currentInput, info);
+        currentInput = this->createToMemoryConfigOpIfNeeded(op, rewriter,
+                                                            currentInput, info);
+      }
+      currentInput =
+          this->createFromDeviceOpIfNeeded(op, rewriter, currentInput, info);
+      op.getResult().replaceAllUsesWith(currentInput);
+      return;
+    }
+
+    // If we should tilize and the input data type is not device tilizable,
+    // tilize on host
+    if (info.shouldTilize() && !canTilizeDataTypeOnDevice(input.dataType) &&
+        opsToCreate.createFromDeviceOp) {
+      currentInput =
+          this->createFromDeviceOpIfNeeded(op, rewriter, currentInput, info);
+      currentInput =
+          this->createToLayoutOpIfNeeded(op, rewriter, currentInput, info);
+      op.getResult().replaceAllUsesWith(currentInput);
+      return;
+    }
+
+    // If we want to tilize a device tensor that is not device tilizable, we
+    // need to tilize on host and move it back
+    if (info.shouldTilize() && !canTilizeDataTypeOnDevice(input.dataType) &&
+        !opsToCreate.createFromDeviceOp) {
+      // Force-create a FromDeviceOp
+      currentInput = this->createFromDeviceOpIfNeeded(
+          op, rewriter, currentInput, info, /*forceCreate=*/true);
+      // tilize on host
+      currentInput =
+          this->createToLayoutOpIfNeeded(op, rewriter, currentInput, info);
+      // move back to device and convert memory config if needed
+      currentInput = this->createToDeviceOpIfNeeded(op, rewriter, currentInput,
+                                                    info, /*forceCreate=*/true);
+      currentInput = this->createToMemoryConfigOpIfNeeded(op, rewriter,
+                                                          currentInput, info);
+      op.getResult().replaceAllUsesWith(currentInput);
+      return;
+    }
+
+    llvm_unreachable("Unreachable code path");
+  }
+
+  void handleDeviceInputNoLayoutTypecast(ttnn::ToLayoutOp op,
+                                         IRRewriter &rewriter,
+                                         mlir::Value currentInput,
+                                         const OpCreationInfo &info) const {
+    const LayoutInfo &input = info.input;
+    const LayoutInfo &output = info.output;
+    const OpsToCreate &opsToCreate = info.opsToCreate;
+    assert(input.layoutEnum == output.layoutEnum &&
+           "Layout should be the same if we're not creating toLayout op");
+
+    // If the result feeds into a CPU-hoisted function, we should move to host
+    // first and perform typecast on host to minimize intermediate DRAM/L1
+    // usage.
+    if (isInputToCPUHoistedFunction(op)) {
+      currentInput =
+          this->createFromDeviceOpIfNeeded(op, rewriter, currentInput, info);
+      currentInput = this->createDataTypeCastingOpIfNeeded(op, rewriter,
+                                                           currentInput, info);
+      currentInput = this->createToMemoryConfigOpIfNeeded(op, rewriter,
+                                                          currentInput, info);
+      op.getResult().replaceAllUsesWith(currentInput);
+      return;
+    }
+
+    // If the output is not tilized and we're moving to host anyway, typecast
+    // on host to avoid a redundant on-device typecast.
+    if (!output.isTilized() && opsToCreate.createFromDeviceOp) {
+      currentInput =
+          this->createFromDeviceOpIfNeeded(op, rewriter, currentInput, info);
+      currentInput = this->createDataTypeCastingOpIfNeeded(op, rewriter,
+                                                           currentInput, info);
+      op.getResult().replaceAllUsesWith(currentInput);
+      return;
+    }
+
+    // Otherwise typecast directly on device. This covers both the tilized case
+    // and the device-to-device untilized case.
+    // If the input is sharded, typecast should happen after converting to
+    // memory.
+    if (input.isSharded()) {
+      currentInput = this->createToMemoryConfigOpIfNeeded(op, rewriter,
+                                                          currentInput, info);
+      currentInput = this->createDataTypeCastingOpIfNeeded(op, rewriter,
+                                                           currentInput, info);
+    } else {
+      currentInput = this->createDataTypeCastingOpIfNeeded(op, rewriter,
+                                                           currentInput, info);
+      currentInput = this->createToMemoryConfigOpIfNeeded(op, rewriter,
+                                                          currentInput, info);
+    }
+    currentInput =
+        this->createFromDeviceOpIfNeeded(op, rewriter, currentInput, info);
+    op.getResult().replaceAllUsesWith(currentInput);
+  }
+
+  void handleDeviceInputLayoutTypecast(ttnn::ToLayoutOp op,
+                                       IRRewriter &rewriter,
+                                       mlir::Value currentInput,
+                                       const OpCreationInfo &info) const {
+    const LayoutInfo &input = info.input;
+    const LayoutInfo &output = info.output;
+    const OpsToCreate &opsToCreate = info.opsToCreate;
+
+    // If the result feeds into a CPU-hoisted function, we should move to host
+    // first and perform both typecast and layout change on host to minimize
+    // intermediate DRAM/L1 usage.
+    if (isInputToCPUHoistedFunction(op)) {
+      currentInput =
+          this->createFromDeviceOpIfNeeded(op, rewriter, currentInput, info);
+      currentInput = this->createDataTypeCastingOpIfNeeded(op, rewriter,
+                                                           currentInput, info);
+      currentInput =
+          this->createToLayoutOpIfNeeded(op, rewriter, currentInput, info);
+      currentInput = this->createToMemoryConfigOpIfNeeded(op, rewriter,
+                                                          currentInput, info);
+      op.getResult().replaceAllUsesWith(currentInput);
+      return;
+    }
+
+    // If we need to untilize and the output can be untilized on device,
+    // typecast and untilize on device.
+    if (info.shouldUntilize() && canUntilizeDataTypeOnDevice(output.dataType)) {
+      untilizeOnDeviceThenFromHost(op, rewriter, currentInput, info);
+      return;
+    }
+
+    // If we need to untilize and the output cannot be untilized on
+    // device typecast on device then untilize on host
+    if (info.shouldUntilize() &&
+        !canUntilizeDataTypeOnDevice(output.dataType) &&
+        opsToCreate.createFromDeviceOp) {
+      currentInput = this->createDataTypeCastingOpIfNeeded(op, rewriter,
+                                                           currentInput, info);
+      currentInput =
+          this->createFromDeviceOpIfNeeded(op, rewriter, currentInput, info);
+      currentInput =
+          this->createToLayoutOpIfNeeded(op, rewriter, currentInput, info);
+      op.getResult().replaceAllUsesWith(currentInput);
+      return;
+    }
+
+    // In case of device to device untilize, where we cannot
+    // untilize on device, typecast on device, untilize on host, then move
+    // back to device
+    if (info.shouldUntilize() &&
+        !canUntilizeDataTypeOnDevice(output.dataType) &&
+        !opsToCreate.createFromDeviceOp) {
+      currentInput = this->createDataTypeCastingOpIfNeeded(op, rewriter,
+                                                           currentInput, info);
+      currentInput = this->createFromDeviceOpIfNeeded(
+          op, rewriter, currentInput, info, /*forceCreate=*/true);
+      currentInput =
+          this->createToLayoutOpIfNeeded(op, rewriter, currentInput, info);
+      currentInput = this->createToDeviceOpIfNeeded(op, rewriter, currentInput,
+                                                    info, /*forceCreate=*/true);
+      op.getResult().replaceAllUsesWith(currentInput);
+      return;
+    }
+
+    // If we should tilize and the input data type is device tilizable, tilize
+    // and typecast on device
+    if (info.shouldTilize() && canTilizeDataTypeOnDevice(input.dataType)) {
+      if (needsShardedTilizePadWorkaround(op, info)) {
+        // tt-metal#30541: unshard → pad → tilize → slice, then typecast and
+        // force reshard.
+        currentInput =
+            handleShardedTilizeWithPadding(op, rewriter, currentInput, info);
+        currentInput = this->createDataTypeCastingOpIfNeeded(
+            op, rewriter, currentInput, info);
+        currentInput = this->createToMemoryConfigOpIfNeeded(
+            op, rewriter, currentInput, info, /*forceCreate=*/true);
+      } else {
+        currentInput =
+            this->createToLayoutOpIfNeeded(op, rewriter, currentInput, info);
+        currentInput = this->createDataTypeCastingOpIfNeeded(
+            op, rewriter, currentInput, info);
+        currentInput = this->createToMemoryConfigOpIfNeeded(op, rewriter,
+                                                            currentInput, info);
+      }
+      currentInput =
+          this->createFromDeviceOpIfNeeded(op, rewriter, currentInput, info);
+      op.getResult().replaceAllUsesWith(currentInput);
+      return;
+    }
+
+    // If we should tilize and the input data type is not device tilizable and
+    // we want to read back from device do everything on host
+    if (info.shouldTilize() && !canTilizeDataTypeOnDevice(input.dataType) &&
+        opsToCreate.createFromDeviceOp) {
+      currentInput =
+          this->createFromDeviceOpIfNeeded(op, rewriter, currentInput, info);
+      currentInput =
+          this->createToLayoutOpIfNeeded(op, rewriter, currentInput, info);
+      currentInput = this->createDataTypeCastingOpIfNeeded(op, rewriter,
+                                                           currentInput, info);
+      op.getResult().replaceAllUsesWith(currentInput);
+      return;
+    }
+
+    // If we should tilize and the input data type is not device tilizable and
+    // we don't want to read back from device: tilize on host, move back to
+    // device, and typecast on device
+    if (info.shouldTilize() && !canTilizeDataTypeOnDevice(input.dataType) &&
+        !opsToCreate.createFromDeviceOp) {
+      // Force-create a FromDeviceOp
+      currentInput = this->createFromDeviceOpIfNeeded(
+          op, rewriter, currentInput, info, /*forceCreate=*/true);
+      // tilize on host
+      currentInput =
+          this->createToLayoutOpIfNeeded(op, rewriter, currentInput, info);
+      // move back to device and convert data type/memory config if needed
+      currentInput = this->createToDeviceOpIfNeeded(op, rewriter, currentInput,
+                                                    info, /*forceCreate=*/true);
+      currentInput = this->createDataTypeCastingOpIfNeeded(op, rewriter,
+                                                           currentInput, info);
+      currentInput = this->createToMemoryConfigOpIfNeeded(op, rewriter,
+                                                          currentInput, info);
+      op.getResult().replaceAllUsesWith(currentInput);
+      return;
+    }
+
+    llvm_unreachable("Unreachable code path");
+  }
+
+  void handleDeviceInputLayoutConversion(ttnn::ToLayoutOp op,
+                                         IRRewriter &rewriter,
+                                         mlir::Value currentInput,
+                                         const OpCreationInfo &info) const {
+    const OpsToCreate &opsToCreate = info.opsToCreate;
+    if (!opsToCreate.createToLayoutOp && !opsToCreate.createDataTypeCastOp) {
+      handleDeviceInputNoLayoutNoTypecast(op, rewriter, currentInput, info);
+      return;
+    }
+    if (opsToCreate.createToLayoutOp && !opsToCreate.createDataTypeCastOp) {
+      handleDeviceInputLayoutNoTypecast(op, rewriter, currentInput, info);
+      return;
+    }
+    if (not opsToCreate.createToLayoutOp && opsToCreate.createDataTypeCastOp) {
+      handleDeviceInputNoLayoutTypecast(op, rewriter, currentInput, info);
+      return;
+    }
+    if (opsToCreate.createToLayoutOp && opsToCreate.createDataTypeCastOp) {
+      handleDeviceInputLayoutTypecast(op, rewriter, currentInput, info);
+      return;
+    }
+    llvm_unreachable("Unreachable code path");
+  }
+
+  /*
+   * Logic for creating ops. Conditions/constraints include:
+   * - When possible, we want to execute operations on device.
+   * - Tilize on device requires dataformat of bfloat16 or float32.
+   * - Typecast on device requires TILIZED tensor.
+   * - Untilize on device requires even width, and page size >
+   *   sizeof(uint32_t). For now, we will always untilize on host. We rarely
+   * need device to device untilize, so the perf hit should be acceptable.
+   */
+  mlir::LogicalResult createLayoutConversionOps(ttnn::ToLayoutOp op,
+                                                IRRewriter &rewriter) const {
+    auto [input, output] = getInputOutputLayouts(op);
+    OpsToCreate opsToCreate = determineRequiredOps(input, output);
+    if (not isCreationValid(op, input, output, opsToCreate)) {
+      return failure();
+    }
+
+    OpCreationInfo info(input, output, opsToCreate);
+
+    Value currentInput = op.getInput();
+
+    if (input.isOnHost()) {
+      handleHostInputLayoutConversion(op, rewriter, currentInput, info);
+      return success();
+    }
+    handleDeviceInputLayoutConversion(op, rewriter, currentInput, info);
+    return success();
+  }
+};
+} // namespace mlir::tt::ttnn

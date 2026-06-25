@@ -1,0 +1,84 @@
+FROM ubuntu:24.04
+SHELL ["/bin/bash", "-c"]
+
+# Set environment variables
+ENV DEBIAN_FRONTEND=noninteractive
+
+ARG TT_METAL_DEPENDENCIES_COMMIT=881ddfabc74a7a5df6b70a514efda6b4bb2f8e74
+
+# Install dependencies
+RUN <<EOT
+set -e
+# ANCHOR: developer_dependencies
+apt-get update -qq
+apt-get install -y -qq \
+    software-properties-common \
+    build-essential \
+    python3-pip \
+    git \
+    libhwloc-dev \
+    pandoc \
+    libtbb-dev \
+    libcapstone-dev \
+    pkg-config \
+    linux-tools-generic \
+    ninja-build \
+    wget \
+    libgtest-dev \
+    cmake \
+    ccache \
+    doxygen \
+    graphviz \
+    libyaml-cpp-dev \
+    curl \
+    jq \
+    sudo \
+    lcov \
+    zstd \
+    unzip
+
+# Install Python 3.12 (native in Ubuntu 24.04)
+apt-get install -y -qq python3.12 python3.12-dev python3.12-venv
+
+# Setup / install metal dependencies
+wget -q https://raw.githubusercontent.com/tenstorrent/tt-metal/${TT_METAL_DEPENDENCIES_COMMIT}/{install_dependencies.sh,tt_metal/sfpi-info.sh,tt_metal/sfpi-version}
+chmod u+x sfpi-info.sh
+bash install_dependencies.sh --docker
+bash install_dependencies.sh --sfpi
+
+# tt-metal's install_dependencies.sh --docker no longer installs ULFM OpenMPI,
+# so install it here so libtt_metal.so links against the ULFM build instead of
+# the system OpenMPI.
+( source install_dependencies.sh --source-only && detect_os && distributed=1 && install_mpi_ulfm )
+
+apt-get clean
+rm -rf /var/lib/apt/lists/*
+# ANCHOR_END: developer_dependencies
+EOT
+
+# Install clang 20
+RUN wget https://apt.llvm.org/llvm.sh && \
+    chmod u+x llvm.sh && \
+    ./llvm.sh 20 && \
+    apt-get update && \
+    apt-get install -y libc++-20-dev libc++abi-20-dev && \
+    rm llvm.sh && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* && \
+    ln -sf /usr/bin/clang-20 /usr/bin/clang && \
+    ln -sf /usr/bin/clang++-20 /usr/bin/clang++ && \
+    ln -sf /usr/bin/clangd-20 /usr/bin/clangd
+
+# Install python packages
+RUN python3.12 -m pip install --no-cache-dir --break-system-packages cmake \
+    sphinx \
+    sphinx-markdown-builder
+
+# Install GitHub CLI
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
+    && apt-get update \
+    && apt-get install -y gh \
+    && rm -rf /var/lib/apt/lists/* \
+    && gh --version

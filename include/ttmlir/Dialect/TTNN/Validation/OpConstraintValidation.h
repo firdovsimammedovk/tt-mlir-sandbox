@@ -1,0 +1,192 @@
+// SPDX-FileCopyrightText: (c) 2025 Tenstorrent AI ULC
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#ifndef TTMLIR_DIALECT_TTNN_VALIDATION_OPCONSTRAINTVALIDATION_H
+#define TTMLIR_DIALECT_TTNN_VALIDATION_OPCONSTRAINTVALIDATION_H
+
+#include "ttmlir/Dialect/TTNN/Analysis/OpConfig.h"
+#include "ttmlir/Dialect/TTNN/IR/TTNNOpsAttrs.h"
+#include "ttmlir/OpModel/TTNN/TTNNOpModel.h"
+
+#include "mlir/IR/Operation.h"
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/StringRef.h"
+#include "llvm/Support/Error.h"
+
+#include <cassert>
+
+namespace mlir::tt::ttnn {
+
+// Context-agnostic utility functions for systematic validation of TTNN
+// operation configurations.
+namespace op_constraint_validation {
+
+enum class ValidationStatus {
+  Success,
+  NotImplemented,
+  MetalBackendError,
+  UnmatchedReferenceConfig,
+  OutOfMemoryError
+};
+
+// Convert ValidationStatus to string for error messages
+llvm::StringRef validationStatusToString(ValidationStatus status);
+
+// Result of a single constraint validation test.
+struct ValidationResult {
+  ValidationStatus status = ValidationStatus::Success;
+
+  // Index in reference configs vector.
+  size_t configIndex = 0;
+
+  // What the backend actually returned (only valid if status == Success).
+  llvm::SmallVector<TTNNLayoutAttr> actualOutputLayouts;
+
+  // L1 memory usage for the output tensor in bytes (only valid if status ==
+  // Success). This is the per-core L1 footprint of the output tensor.
+  uint64_t outputL1Usage = 0;
+
+  // CB peak L1 usage from op_model. Only valid if Success.
+  uint64_t cbPeakUsage = 0;
+
+  // Error message if status != Success.
+  std::string errorMessage;
+
+  ValidationResult() = default;
+
+  explicit ValidationResult(
+      size_t configIndex, llvm::SmallVector<TTNNLayoutAttr> actualOutputLayouts,
+      uint64_t outputL1Usage = 0, uint64_t cbPeakUsage = 0)
+      : configIndex(configIndex),
+        actualOutputLayouts(std::move(actualOutputLayouts)),
+        outputL1Usage(outputL1Usage), cbPeakUsage(cbPeakUsage) {}
+
+  // Accessors for the first actual output layout (convenience for single-output
+  // ops).
+  // TODO(bmalesevic, #7108): after resolving, consider removing these if they
+  // encourage misuse for multi-output ops.
+  TTNNLayoutAttr getFirstActualOutputLayout() const {
+    return actualOutputLayouts.empty() ? nullptr : actualOutputLayouts[0];
+  }
+  TTNNLayoutAttr checkAndGetFirstActualOutputLayout() const {
+    assert(!actualOutputLayouts.empty());
+    return actualOutputLayouts.front();
+  }
+
+  static ValidationResult success(size_t configIndex,
+                                  TTNNLayoutAttr actualOutputLayout,
+                                  uint64_t outputL1Usage = 0,
+                                  uint64_t cbPeakUsage = 0) {
+    return ValidationResult(
+        configIndex, llvm::SmallVector<TTNNLayoutAttr>{actualOutputLayout},
+        outputL1Usage, cbPeakUsage);
+  }
+
+  static ValidationResult
+  success(size_t configIndex,
+          llvm::SmallVector<TTNNLayoutAttr> actualOutputLayouts,
+          uint64_t outputL1Usage = 0, uint64_t cbPeakUsage = 0) {
+    return ValidationResult(configIndex, std::move(actualOutputLayouts),
+                            outputL1Usage, cbPeakUsage);
+  }
+
+  static ValidationResult error(ValidationStatus status, std::string message) {
+    ValidationResult result;
+    result.status = status;
+    result.errorMessage = std::move(message);
+    return result;
+  }
+
+  static ValidationResult notImplemented(std::string message) {
+    return error(ValidationStatus::NotImplemented, std::move(message));
+  }
+
+  static ValidationResult metalBackendError(std::string message) {
+    return error(ValidationStatus::MetalBackendError, std::move(message));
+  }
+
+  static ValidationResult unmatchedReferenceConfig(std::string message) {
+    return error(ValidationStatus::UnmatchedReferenceConfig,
+                 std::move(message));
+  }
+
+  static ValidationResult outOfMemoryError(std::string message) {
+    return error(ValidationStatus::OutOfMemoryError, std::move(message));
+  }
+
+  bool isSuccess() const { return status == ValidationStatus::Success; }
+  bool isNotImplemented() const {
+    return status == ValidationStatus::NotImplemented;
+  }
+  bool isError() const { return status != ValidationStatus::Success; }
+  bool isMetalBackendError() const {
+    return status == ValidationStatus::MetalBackendError;
+  }
+};
+
+// Simple validation with all layouts.
+// op: Operation to validate.
+// inputLayouts: Input tensor layouts for the operation.
+// config: Operation configuration to test.
+// additionalL1Usage: Additional L1 memory usage (in bytes) that must be
+//                    accounted for during validation. This is used when
+//                    validating ops that execute while other tensors occupy L1
+//                    (e.g., during chain merging where Chain A's output stays
+//                    in L1 while Chain B executes).
+// Returns: ValidationResult where status indicates the outcome:
+//   - status == Success: Operation validated successfully
+//   - status == NotSupported: Operation not supported for validation (expected
+//                             limitation)
+//   - status == BackendError: Backend error occurred
+//   - status == ValidationError: Validation failed (e.g., not enough L1)
+// Callers should check result.status to handle each case appropriately.
+// "NotSupported" is not an error - it indicates expected limitations.
+ValidationResult validateOperation(Operation *op,
+                                   llvm::ArrayRef<TTNNLayoutAttr> inputLayouts,
+                                   const OpConfig &config,
+                                   uint64_t additionalL1Usage = 0);
+
+// Test multiple attributes with all layouts.
+// op: Operation to validate.
+// inputLayouts: All input tensor layouts for the operation.
+// opConfigs: List of op configs to test (they don't have to be full, i.e.
+//            may contain only op-specific attrs).
+// referenceConfigs: Reference configurations to search for matches. If empty,
+//                   only validation is performed without matching to reference.
+// Returns: Vector of ValidationResults, one per op config tested.
+// Each ValidationResult can have different status - check individually.
+std::vector<ValidationResult>
+validateWithMultipleAttributes(Operation *op,
+                               llvm::ArrayRef<TTNNLayoutAttr> inputLayouts,
+                               llvm::ArrayRef<OpConfig> opConfigs,
+                               llvm::ArrayRef<OpConfig> referenceConfigs);
+
+// Validate an OpConstraints result against the L1 memory budget derived from
+// the given context operation (used to look up device attributes and module-
+// level tensorL1UsageCap).  This is the shared L1 budget check used by both
+// the Operation*-based validateOperation and the template overload below.
+ValidationResult
+checkConstraintsResult(Operation *contextOp,
+                       llvm::Expected<op_model::OpConstraints> constraints,
+                       uint64_t additionalL1Usage = 0);
+
+// Op-less validation: calls OpModel<OpType>::getOpConstraints directly with
+// the forwarded arguments, then validates the result against the L1 memory
+// budget.  |contextOp| is any operation in the module (e.g. the consumer) and
+// is used only to look up device/module attributes — it is NOT the operation
+// being validated.
+template <typename OpType, typename... Args>
+ValidationResult validateOperation(Operation *contextOp,
+                                   uint64_t additionalL1Usage, Args &&...args) {
+  auto constraints =
+      op_model::OpModel<OpType>::getOpConstraints(std::forward<Args>(args)...);
+  return checkConstraintsResult(contextOp, std::move(constraints),
+                                additionalL1Usage);
+}
+
+} // namespace op_constraint_validation
+
+} // namespace mlir::tt::ttnn
+
+#endif // TTMLIR_DIALECT_TTNN_VALIDATION_OPCONSTRAINTVALIDATION_H

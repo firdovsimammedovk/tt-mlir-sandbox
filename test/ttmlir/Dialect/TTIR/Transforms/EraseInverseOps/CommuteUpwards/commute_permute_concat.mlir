@@ -1,0 +1,15 @@
+// RUN: ttmlir-opt --ttir-erase-inverse-ops="force=true enable-commute-downwards=false" -o %t %s
+// RUN: FileCheck %s --input-file=%t
+
+module {
+  func.func @test_permute_concat_commute_upwards(%arg0: tensor<32x64xbf16>, %arg1: tensor<32x64xbf16>) -> tensor<64x64xbf16> {
+    // CHECK: %[[PERMUTE1:[0-9]+]] = "ttir.permute"(%arg0) <{permutation = array<i64: 1, 0>}>
+    // CHECK: %[[PERMUTE2:[0-9]+]] = "ttir.permute"(%arg1) <{permutation = array<i64: 1, 0>}>
+    // CHECK: %[[CONCAT:[0-9]+]] = "ttir.concat"(%[[PERMUTE1]], %[[PERMUTE2]]
+    // CHECK dim = 1
+    %1 = "ttir.concat"(%arg0, %arg1) <{dim = 0 : si32}> : (tensor<32x64xbf16>, tensor<32x64xbf16>) -> tensor<64x64xbf16>
+    %3 = "ttir.permute"(%1) <{permutation = array<i64: 1, 0>}> : (tensor<64x64xbf16>) -> tensor<64x64xbf16>
+
+    return %3 : tensor<64x64xbf16>
+  }
+}

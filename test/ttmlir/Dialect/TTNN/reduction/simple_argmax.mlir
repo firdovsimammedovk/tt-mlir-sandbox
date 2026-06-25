@@ -1,0 +1,63 @@
+// RUN: ttmlir-opt --ttir-to-ttnn-backend-pipeline -o %t %s
+// RUN: FileCheck %s --input-file=%t
+
+module attributes {} {
+  func.func public @argmax_2d(%arg0: tensor<64x64xf32>) -> tensor<64x1xi32> {
+    // CHECK-LABEL: func.func public @argmax_2d(
+    // CHECK: "ttnn.argmax"
+    // CHECK-SAME: {dim = 1 : i32, keep_dim = true}>
+    // CHECK-SAME: tensor<64x64xf32
+    // CHECK-SAME: -> tensor<64x1xui32
+    %1 = "ttir.argmax"(%arg0) <{dim_arg = [1 : i32], keep_dim = true}> : (tensor<64x64xf32>) -> tensor<64x1xi32>
+    return %1 : tensor<64x1xi32>
+  }
+
+  func.func public @argmax_3d(%arg0: tensor<128x28x28xf32>) -> tensor<128x28xi32> {
+    // CHECK-LABEL: func.func public @argmax_3d(
+    // CHECK-NOT: "ttnn.permute"
+    // CHECK: "ttnn.argmax"
+    // CHECK-SAME: {dim = 1 : i32, keep_dim = false}>
+    %1 = "ttir.argmax"(%arg0) <{dim_arg = [1 : i32], keep_dim = false}> : (tensor<128x28x28xf32>) -> tensor<128x28xi32>
+    return %1 : tensor<128x28xi32>
+  }
+
+  func.func public @argmax_3d_dim0(%arg0: tensor<128x32x64xf32>) -> tensor<32x64xi32> {
+    // CHECK-LABEL: func.func public @argmax_3d_dim0(
+    // CHECK-NOT: "ttnn.permute"
+    // CHECK: "ttnn.argmax"
+    // CHECK-SAME: {dim = 0 : i32, keep_dim = false}>
+    %1 = "ttir.argmax"(%arg0) <{dim_arg = [0 : i32], keep_dim = false}> : (tensor<128x32x64xf32>) -> tensor<32x64xi32>
+    return %1 : tensor<32x64xi32>
+  }
+
+  func.func public @argmax_4d_dim1_keepdim(%arg0: tensor<2x8x32x64xf32>) -> tensor<2x1x32x64xi32> {
+    // CHECK-LABEL: func.func public @argmax_4d_dim1_keepdim(
+    // CHECK-NOT: "ttnn.permute"
+    // CHECK: "ttnn.argmax"
+    // CHECK-SAME: {dim = 1 : i32, keep_dim = true}>
+    %1 = "ttir.argmax"(%arg0) <{dim_arg = [1 : i32], keep_dim = true}> : (tensor<2x8x32x64xf32>) -> tensor<2x1x32x64xi32>
+    return %1 : tensor<2x1x32x64xi32>
+  }
+
+  func.func public @argmax_3d_last_dim(%arg0: tensor<128x28x28xf32>) -> tensor<128x28xi32> {
+    // CHECK-LABEL: func.func public @argmax_3d_last_dim(
+    // CHECK-NOT: "ttnn.permute"
+    // CHECK: "ttnn.argmax"
+    // CHECK-SAME: {dim = 2 : i32, keep_dim = false}>
+    // CHECK-SAME: tensor<128x28x28xf32
+    // CHECK-SAME: -> tensor<128x28xui32
+    %1 = "ttir.argmax"(%arg0) <{dim_arg = [2 : i32], keep_dim = false}> : (tensor<128x28x28xf32>) -> tensor<128x28xi32>
+    return %1 : tensor<128x28xi32>
+  }
+
+  func.func public @argmax_4d(%arg0: tensor<4x8x128x64xf32>) -> tensor<4x8x128xi32> {
+    // CHECK-LABEL: func.func public @argmax_4d(
+    // CHECK-NOT: "ttnn.permute"
+    // CHECK: "ttnn.argmax"
+    // CHECK-SAME: {dim = 3 : i32, keep_dim = false}>
+    // CHECK-SAME: tensor<4x8x128x64xf32
+    // CHECK-SAME: -> tensor<4x8x128xui32
+    %1 = "ttir.argmax"(%arg0) <{dim_arg = [3 : i32], keep_dim = false}> : (tensor<4x8x128x64xf32>) -> tensor<4x8x128xi32>
+    return %1 : tensor<4x8x128xi32>
+  }
+}

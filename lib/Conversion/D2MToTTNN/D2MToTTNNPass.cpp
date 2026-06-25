@@ -1,0 +1,71 @@
+// SPDX-FileCopyrightText: (c) 2025 Tenstorrent AI ULC
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#include "ttmlir/Conversion/D2MToTTNN/D2MToTTNN.h"
+
+#include "ttmlir/Dialect/D2M/IR/D2M.h"
+#include "ttmlir/Dialect/D2M/IR/D2MOps.h"
+#include "ttmlir/Dialect/D2M/Utils/DMAUtils.h"
+#include "ttmlir/Dialect/TTCore/IR/TTCore.h"
+#include "ttmlir/Dialect/TTCore/IR/TTCoreOps.h"
+#include "ttmlir/Dialect/TTIR/IR/TTIR.h"
+#include "ttmlir/Dialect/TTKernel/IR/TTKernel.h"
+#include "ttmlir/Dialect/TTNN/IR/TTNN.h"
+
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/EmitC/IR/EmitC.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Math/IR/Math.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/BuiltinDialect.h"
+#include "mlir/Pass/Pass.h"
+#include "mlir/Support/LogicalResult.h"
+
+using namespace mlir;
+using namespace mlir::tt;
+namespace mlir::tt::d2m {
+
+#define GEN_PASS_DEF_CONVERTD2MTOTTNN
+#include "ttmlir/Conversion/Passes.h.inc" // impl::ConvertD2MToTTNNBase
+
+} // namespace mlir::tt::d2m
+
+namespace {
+
+struct ConvertD2MToTTNNPass final
+    : d2m::impl::ConvertD2MToTTNNBase<ConvertD2MToTTNNPass> {
+
+  ConvertD2MToTTNNPass() = default;
+  ConvertD2MToTTNNPass(const d2m::ConvertD2MToTTNNOptions &options)
+      : ConvertD2MToTTNNBase(options) {}
+
+  void runOnOperation() final {
+    ModuleOp moduleOp = getOperation();
+
+    if (failed(d2m::utils::checkBackendDmCoreSupport(moduleOp, "D2MToTTNN"))) {
+      signalPassFailure();
+      return;
+    }
+
+    auto result = runD2MToTTNNConversion(moduleOp, mathFidelity);
+    if (failed(result)) {
+      signalPassFailure();
+    }
+  }
+};
+} // namespace
+
+namespace mlir::tt {
+
+std::unique_ptr<OperationPass<ModuleOp>> createConvertD2MToTTNNPass() {
+  return std::make_unique<ConvertD2MToTTNNPass>();
+}
+
+std::unique_ptr<OperationPass<ModuleOp>>
+createConvertD2MToTTNNPass(const d2m::ConvertD2MToTTNNOptions &options) {
+  return std::make_unique<ConvertD2MToTTNNPass>(options);
+}
+
+} // namespace mlir::tt

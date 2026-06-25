@@ -1,0 +1,23 @@
+// TODO(dmilinkovic): re-enable CPU-hoisted const-eval once EmitC support for CPU-hoisted ops lands - issue #6100.
+// RUN: ttmlir-opt --ttir-to-ttnn-common-pipeline="enable-cpu-hoisted-const-eval=false system-desc-path=%system_desc_path%" -o %t.mlir %s
+//
+// RUN: ttmlir-opt --ttnn-common-to-runtime-pipeline -o %t_rt.mlir %t.mlir
+// RUN: ttmlir-translate --ttnn-to-flatbuffer -o %basename_t.ttnn %t_rt.mlir
+//
+// RUN: ttmlir-opt --ttnn-common-to-emitc-pipeline -o %t2.mlir %t.mlir
+// RUN: ttmlir-translate --mlir-to-cpp -o %basename_t.cpp %t2.mlir
+
+  func.func @bitwise_and(%arg0: tensor<64x128xi32>, %arg1: tensor<64x128xi32>) -> tensor<64x128xi32> {
+    %1 = "ttir.bitwise_and"(%arg0, %arg1) : (tensor<64x128xi32>, tensor<64x128xi32>) -> tensor<64x128xi32>
+    return %1 : tensor<64x128xi32>
+  }
+
+  func.func @bitwise_or(%arg0: tensor<64x128xi32>, %arg1: tensor<64x128xi32>) -> tensor<64x128xi32> {
+    %1 = "ttir.bitwise_or"(%arg0, %arg1) : (tensor<64x128xi32>, tensor<64x128xi32>) -> tensor<64x128xi32>
+    return %1 : tensor<64x128xi32>
+  }
+
+  func.func @bitwise_xor(%arg0: tensor<64x128xi32>, %arg1: tensor<64x128xi32>) -> tensor<64x128xi32> {
+    %1 = "ttir.bitwise_xor"(%arg0, %arg1) : (tensor<64x128xi32>, tensor<64x128xi32>) -> tensor<64x128xi32>
+    return %1 : tensor<64x128xi32>
+  }

@@ -1,0 +1,495 @@
+// SPDX-FileCopyrightText: (c) 2025 Tenstorrent AI ULC
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#include "ttmlir/Dialect/TTNN/Validation/OpConstraintValidation.h"
+
+#include "ttmlir/Dialect/TTCore/IR/TTCore.h"
+#include "ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h"
+#include "ttmlir/Dialect/TTCore/Transforms/Transforms.h"
+#include "ttmlir/Dialect/TTNN/Analysis/OpConfig.h"
+#include "ttmlir/Dialect/TTNN/IR/TTNN.h"
+#include "ttmlir/Dialect/TTNN/IR/TTNNOps.h"
+#include "ttmlir/Dialect/TTNN/IR/TTNNOpsAttrs.h"
+#include "ttmlir/Dialect/TTNN/IR/TTNNTraits.h"
+#include "ttmlir/Dialect/TTNN/Utils/OptimizerUtils.h"
+#include "ttmlir/Dialect/TTNN/Utils/Utils.h"
+#include "ttmlir/OpModel/TTNN/SingletonDeviceContext.h"
+
+#include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/MLIRContext.h"
+#include "mlir/IR/Value.h"
+#include "llvm/ADT/SmallVector.h"
+
+#include "gtest/gtest.h"
+
+using namespace mlir::tt::ttnn;
+using namespace mlir::tt;
+
+class OpConstraintValidationTest : public ::testing::Test {
+public:
+  mlir::MLIRContext context;
+  mlir::OwningOpRef<mlir::ModuleOp> module;
+  mlir::OpBuilder builder = mlir::OpBuilder(&context);
+
+  void SetUp() override {
+    // Initialize context and module
+    context.loadDialect<mlir::tt::ttcore::TTCoreDialect>();
+    context.loadDialect<mlir::tt::ttnn::TTNNDialect>();
+    module = mlir::ModuleOp::create(builder.getUnknownLoc());
+    builder.setInsertionPointToStart(&module->getBodyRegion().front());
+    mlir::tt::ttcore::registerDevice(module.get());
+    mlir::tt::ttnn::op_model::SingletonDeviceContext::setSystemDesc(
+        mlir::tt::ttcore::getCurrentScopeSystemDesc(module.get()));
+    mlir::tt::ttnn::op_model::SingletonDeviceContext::getInstance()
+        .openMockDevice();
+
+    // Set default L1 usage cap to 100% for all tests
+    setL1UsageCap(1.0f);
+  }
+
+  void TearDown() override {
+    mlir::tt::ttnn::op_model::SingletonDeviceContext::getInstance()
+        .closeInstance();
+  }
+
+  void setL1UsageCap(float cap) {
+    module->getOperation()->setAttr(utils::g_TensorL1UsageCapAttrName,
+                                    builder.getF32FloatAttr(cap));
+  }
+
+  TTNNLayoutAttr createTiledLayout(const llvm::ArrayRef<int64_t> &tensorShape,
+                                   BufferType bufferType,
+                                   TensorMemoryLayout tensorMemoryLayout,
+                                   const llvm::ArrayRef<int64_t> &gridShape = {
+                                       1, 1}) {
+    auto elementType = mlir::tt::ttcore::TileType::get(builder.getBF16Type());
+    auto deviceAttr = mlir::tt::ttcore::lookupDevice(module.get());
+    return TTNNLayoutAttr::Builder(&context, tensorShape, elementType)
+        .setBufferType(bufferType)
+        .setMemoryLayout(tensorMemoryLayout)
+        .setGridShape(gridShape)
+        .buildWithCanonicalCorePlacement(deviceAttr);
+  }
+
+  // Helper to create layout with custom element type
+  TTNNLayoutAttr createTiledLayoutWithElementType(
+      const llvm::ArrayRef<int64_t> &tensorShape, mlir::Type elementType,
+      BufferType bufferType, TensorMemoryLayout tensorMemoryLayout,
+      const llvm::ArrayRef<int64_t> &gridShape = {1, 1}) {
+    auto tileType = mlir::tt::ttcore::TileType::get(elementType);
+    auto deviceAttr = mlir::tt::ttcore::lookupDevice(module.get());
+    return TTNNLayoutAttr::Builder(&context, tensorShape, tileType)
+        .setBufferType(bufferType)
+        .setMemoryLayout(tensorMemoryLayout)
+        .setGridShape(gridShape)
+        .buildWithCanonicalCorePlacement(deviceAttr);
+  }
+
+  // Helper to create a simple AddOp for testing
+  AddOp createMockAddOp() {
+    llvm::SmallVector<int64_t> inputShape = {1, 1, 32, 32};
+    auto layout = createTiledLayout(inputShape, BufferType::L1,
+                                    TensorMemoryLayout::Interleaved);
+
+    // Create tensor type with layout
+    auto tensorType =
+        mlir::RankedTensorType::get(inputShape, builder.getBF16Type(), layout);
+
+    // Create two input tensors using OnesOp (simpler than EmptyOp)
+    auto input1 = builder.create<OnesOp>(builder.getUnknownLoc(), tensorType,
+                                         /*device=*/nullptr,
+                                         ShapeAttr::get(&context, inputShape));
+
+    auto input2 = builder.create<OnesOp>(builder.getUnknownLoc(), tensorType,
+                                         /*device=*/nullptr,
+                                         ShapeAttr::get(&context, inputShape));
+
+    // Create AddOp
+    return builder.create<AddOp>(builder.getUnknownLoc(), tensorType,
+                                 input1.getResult(), input2.getResult());
+  }
+
+  // Helper to create OpConfig for testing
+  OpConfig createTestConfig() {
+    auto outputLayout = createTiledLayout({1, 1, 32, 32}, BufferType::L1,
+                                          TensorMemoryLayout::Interleaved);
+    return OpConfig(outputLayout, OpConfig::OpSpecificAttrs{});
+  }
+};
+
+// Test validateOperation with real AddOp and proper layouts.
+TEST_F(OpConstraintValidationTest, ValidateOperationRealAddOp) {
+  auto addOp = createMockAddOp();
+  auto layouts = ttnn::utils::extractInputLayouts(addOp);
+  OpConfig config = createTestConfig();
+
+  auto result =
+      op_constraint_validation::validateOperation(addOp, layouts, config);
+
+  // This should either succeed or fail gracefully (not crash)
+  // The exact result depends on OpModel implementation
+  if (result.isSuccess()) {
+    EXPECT_GE(result.configIndex, 0u);
+    EXPECT_TRUE(result.getFirstActualOutputLayout());
+  } else {
+    // Validation failed - check that error message is populated
+    EXPECT_FALSE(result.errorMessage.empty());
+    // Check that status is one of the error types
+    EXPECT_TRUE(result.isError());
+  }
+}
+
+// Test validateWithMultipleAttributes with real AddOp.
+TEST_F(OpConstraintValidationTest, ValidateWithMultipleAttributesRealAddOp) {
+  auto addOp = createMockAddOp();
+  auto layouts = ttnn::utils::extractInputLayouts(addOp);
+
+  // Create 10 empty attributes
+  std::vector<OpConfig> configs(10);
+
+  // Test with null reference configs (should succeed if validation passes)
+  auto results = op_constraint_validation::validateWithMultipleAttributes(
+      addOp, layouts, configs, /*referenceConfigs=*/{});
+
+  EXPECT_EQ(results.size(), 10);
+  // Each result should have a valid status
+  for (const auto &result : results) {
+    // Result can be success or any error type - just check it's valid
+    if (result.isSuccess()) {
+      EXPECT_GE(result.configIndex, 0u);
+      EXPECT_TRUE(result.getFirstActualOutputLayout());
+    } else {
+      EXPECT_FALSE(result.errorMessage.empty());
+    }
+  }
+}
+
+// Test validateOperation with UpdateCacheOp expecting uint32 type for
+// update_index.
+TEST_F(OpConstraintValidationTest, UpdateCacheOpWithInvalidUpdateIndexType) {
+  // Create cache tensor (4D tensor with BF16 type)
+  llvm::SmallVector<int64_t> cacheShape = {1, 1, 64, 32};
+  auto cacheLayout = createTiledLayout(cacheShape, BufferType::L1,
+                                       TensorMemoryLayout::Interleaved);
+  auto cacheTensorType = mlir::RankedTensorType::get(
+      cacheShape, builder.getBF16Type(), cacheLayout);
+  auto cacheOp = builder.create<OnesOp>(
+      builder.getUnknownLoc(), cacheTensorType,
+      /*device=*/nullptr, ShapeAttr::get(&context, cacheShape));
+
+  // Create input tensor (4D tensor with dim 2 = 1)
+  llvm::SmallVector<int64_t> inputShape = {1, 1, 1, 32};
+  auto inputLayout = createTiledLayout(inputShape, BufferType::L1,
+                                       TensorMemoryLayout::Interleaved);
+  auto inputTensorType = mlir::RankedTensorType::get(
+      inputShape, builder.getBF16Type(), inputLayout);
+  auto inputOp = builder.create<OnesOp>(
+      builder.getUnknownLoc(), inputTensorType,
+      /*device=*/nullptr, ShapeAttr::get(&context, inputShape));
+
+  // Create update_index tensor with WRONG type (BF16 instead of uint32)
+  // This should cause validation to fail
+  llvm::SmallVector<int64_t> updateIndexShape = {1, 1, 32, 32};
+  auto updateIndexLayout = createTiledLayout(updateIndexShape, BufferType::L1,
+                                             TensorMemoryLayout::Interleaved);
+  auto updateIndexTensorType = mlir::RankedTensorType::get(
+      updateIndexShape, builder.getBF16Type(), updateIndexLayout);
+  auto updateIndexOp = builder.create<OnesOp>(
+      builder.getUnknownLoc(), updateIndexTensorType,
+      /*device=*/nullptr, ShapeAttr::get(&context, updateIndexShape));
+
+  // Create UpdateCacheOp (inplace operation, no result type)
+  auto updateCacheOp = builder.create<ttnn::UpdateCacheOp>(
+      builder.getUnknownLoc(), cacheOp.getResult(), inputOp.getResult(),
+      updateIndexOp.getResult(), /*batch_offset=*/0);
+
+  // Extract layouts and create config
+  auto layouts = ttnn::utils::extractInputLayouts(updateCacheOp);
+  OpConfig config = createTestConfig();
+
+  // Validate the operation
+  auto result = op_constraint_validation::validateOperation(updateCacheOp,
+                                                            layouts, config);
+
+  // Should fail because update_index has wrong type (BF16 instead of uint32)
+  EXPECT_TRUE(result.isError());
+  EXPECT_FALSE(result.errorMessage.empty());
+
+  // Now create a CORRECT UpdateCacheOp with uint32 type for update_index
+  // Create uint32 type for update_index
+  auto uint32Type = mlir::IntegerType::get(
+      &context, 32, mlir::IntegerType::SignednessSemantics::Unsigned);
+  auto uint32UpdateIndexLayout = createTiledLayoutWithElementType(
+      updateIndexShape, uint32Type, BufferType::L1,
+      TensorMemoryLayout::Interleaved);
+  auto uint32UpdateIndexTensorType = mlir::RankedTensorType::get(
+      updateIndexShape, uint32Type, uint32UpdateIndexLayout);
+  auto uint32UpdateIndexOp = builder.create<OnesOp>(
+      builder.getUnknownLoc(), uint32UpdateIndexTensorType,
+      /*device=*/nullptr, ShapeAttr::get(&context, updateIndexShape));
+
+  // Create UpdateCacheOp with correct uint32 type
+  auto validUpdateCacheOp = builder.create<ttnn::UpdateCacheOp>(
+      builder.getUnknownLoc(), cacheOp.getResult(), inputOp.getResult(),
+      uint32UpdateIndexOp.getResult(), /*batch_offset=*/0);
+
+  // Extract layouts and validate
+  auto validLayouts = ttnn::utils::extractInputLayouts(validUpdateCacheOp);
+  auto validResult = op_constraint_validation::validateOperation(
+      validUpdateCacheOp, validLayouts, config);
+
+  // Should succeed with uint32 type
+  EXPECT_TRUE(validResult.isSuccess());
+}
+
+// Test ValidationStatus::NotImplemented
+// AllocOp carries the OpModelExempt trait and therefore does not implement
+// the OpModel interface. validateOperation must surface this as a
+// NotImplemented ValidationResult so the optimizer can fall back gracefully
+// (see GreedyMemoryLayoutPropagation / L1SpillManagement, which both branch
+// on result.isNotImplemented()). Regressing this contract — e.g. by removing
+// the OpModelExempt special case in OpConstraintValidation::validateConstraints
+// — would crash the optimizer at runtime via reportFatalInternalError.
+TEST_F(OpConstraintValidationTest, ValidationStatusNotImplemented) {
+  llvm::SmallVector<int64_t> tensorShape = {1, 1, 32, 32};
+  auto layout = createTiledLayout(tensorShape, BufferType::L1,
+                                  TensorMemoryLayout::Interleaved);
+  auto tensorType =
+      mlir::RankedTensorType::get(tensorShape, builder.getBF16Type(), layout);
+
+  auto allocOp = builder.create<AllocOp>(
+      builder.getUnknownLoc(), tensorType, builder.getI64IntegerAttr(0),
+      builder.getI64IntegerAttr(2048),
+      BufferTypeAttr::get(&context, BufferType::L1));
+
+  auto layouts = ttnn::utils::extractInputLayouts(allocOp);
+  OpConfig config = createTestConfig();
+
+  auto result =
+      op_constraint_validation::validateOperation(allocOp, layouts, config);
+
+  // Should return NotImplemented
+  EXPECT_TRUE(result.isNotImplemented());
+  EXPECT_EQ(result.status,
+            op_constraint_validation::ValidationStatus::NotImplemented);
+  EXPECT_TRUE(result.isError());
+  EXPECT_FALSE(result.isSuccess());
+  EXPECT_FALSE(result.errorMessage.empty());
+}
+
+// Regression test for "OpModelExempt -> NotImplemented" optimizer contract.
+//
+// Background: ops that opt out of the OpModel interface via the OpModelExempt
+// trait (e.g. CCL ops, trace ops, host/alloc ops, GetDeviceOp...) do not
+// implement TTNN_OpModelInterface at all. The optimizer's L1 spill / memory
+// layout propagation passes call op_constraint_validation::validateOperation
+// on every op in the IR and rely on observing isNotImplemented() for ops
+// they cannot analyze, so they can fall back (e.g. evict L1) instead of
+// taking layout decisions on bogus data.
+//
+// Before the OpModelExempt change, these ops had explicit stub
+// getOpConstraints / getOpRuntime overrides returning OpNotSupportedError,
+// which validateOperation translated to NotImplemented via handleAllErrors.
+// After OpModelExempt removed those stubs, dyn_cast<OpModel>(op) returns
+// nullptr for exempt ops and the original code path called
+// llvm::reportFatalInternalError, crashing the compiler.
+//
+// This test asserts the contract using two independent OpModelExempt ops:
+//   - GetDeviceOp: a trivial OpModelExempt op with no tensor inputs.
+//   - AllocOp:    an OpModelExempt op with a tensor result.
+// Both must be observed as NotImplemented (never crash, never silently
+// succeed). If someone removes the OpModelExempt fallback in
+// validateConstraints, both calls will hit reportFatalInternalError and
+// abort this test process.
+TEST_F(OpConstraintValidationTest,
+       OpModelExemptOpsReturnNotImplementedNotFatal) {
+  // Sanity: the trait-driven contract we are asserting.
+  static_assert(GetDeviceOp::hasTrait<OpModelExempt>(),
+                "GetDeviceOp must carry the OpModelExempt trait for this "
+                "regression test to be meaningful.");
+  static_assert(AllocOp::hasTrait<OpModelExempt>(),
+                "AllocOp must carry the OpModelExempt trait for this "
+                "regression test to be meaningful.");
+
+  // GetDeviceOp: zero tensor inputs, just produces a device value.
+  auto getDeviceOp = builder.create<GetDeviceOp>(
+      builder.getUnknownLoc(), builder.getType<DeviceType>(),
+      MeshShapeAttr::get(&context, 1, 1), MeshOffsetAttr::get(&context, 0, 0));
+
+  // Ensure the op truly does not implement the OpModel interface.
+  ASSERT_FALSE(mlir::isa<OpModel>(getDeviceOp.getOperation()))
+      << "GetDeviceOp unexpectedly implements OpModel; the OpModelExempt -> "
+         "NotImplemented fallback would never be exercised by this test.";
+
+  OpConfig config = createTestConfig();
+  auto getDeviceResult = op_constraint_validation::validateOperation(
+      getDeviceOp, /*inputLayouts=*/{}, config);
+
+  EXPECT_TRUE(getDeviceResult.isNotImplemented())
+      << "OpModelExempt op (GetDeviceOp) must surface NotImplemented to "
+         "preserve the optimizer fallback path. Status="
+      << op_constraint_validation::validationStatusToString(
+             getDeviceResult.status)
+             .str();
+  EXPECT_FALSE(getDeviceResult.isSuccess());
+  EXPECT_FALSE(getDeviceResult.errorMessage.empty());
+
+  // AllocOp: same contract via a second exempt op with different shape.
+  llvm::SmallVector<int64_t> tensorShape = {1, 1, 32, 32};
+  auto layout = createTiledLayout(tensorShape, BufferType::L1,
+                                  TensorMemoryLayout::Interleaved);
+  auto tensorType =
+      mlir::RankedTensorType::get(tensorShape, builder.getBF16Type(), layout);
+  auto allocOp = builder.create<AllocOp>(
+      builder.getUnknownLoc(), tensorType, builder.getI64IntegerAttr(0),
+      builder.getI64IntegerAttr(2048),
+      BufferTypeAttr::get(&context, BufferType::L1));
+
+  ASSERT_FALSE(mlir::isa<OpModel>(allocOp.getOperation()))
+      << "AllocOp unexpectedly implements OpModel; the OpModelExempt -> "
+         "NotImplemented fallback would never be exercised by this test.";
+
+  auto allocLayouts = ttnn::utils::extractInputLayouts(allocOp);
+  auto allocResult = op_constraint_validation::validateOperation(
+      allocOp, allocLayouts, config);
+
+  EXPECT_TRUE(allocResult.isNotImplemented())
+      << "OpModelExempt op (AllocOp) must surface NotImplemented to preserve "
+         "the optimizer fallback path. Status="
+      << op_constraint_validation::validationStatusToString(allocResult.status)
+             .str();
+}
+
+// Test ValidationStatus::MetalBackendError
+// ToLayoutOp with incompatible layout configurations triggers backend error
+TEST_F(OpConstraintValidationTest, ValidationStatusMetalBackendError) {
+  // Create helper for row major layout (non-tiled)
+  auto createRowMajorHSLayout = [&](const llvm::ArrayRef<int64_t> &tensorShape,
+                                    BufferType bufferType,
+                                    TensorMemoryLayout tensorMemoryLayout) {
+    // Row major uses scalar element type instead of tiled.
+    auto deviceAttr = mlir::tt::ttcore::lookupDevice(module.get());
+    return TTNNLayoutAttr::Builder(&context, tensorShape, builder.getBF16Type())
+        .setBufferType(bufferType)
+        .setMemoryLayout(tensorMemoryLayout)
+        .setGridShape(llvm::ArrayRef<int64_t>{64, 1})
+        .buildWithCanonicalCorePlacement(deviceAttr);
+  };
+
+  llvm::SmallVector<int64_t> tensorShape = {64, 1024};
+
+  // Input: DRAM Tiled layout
+  auto inputLayout = createTiledLayout(tensorShape, BufferType::DRAM,
+                                       TensorMemoryLayout::Interleaved);
+  auto inputTensorType = mlir::RankedTensorType::get(
+      tensorShape, builder.getBF16Type(), inputLayout);
+
+  auto input = builder.create<OnesOp>(builder.getUnknownLoc(), inputTensorType,
+                                      /*device=*/nullptr,
+                                      ShapeAttr::get(&context, tensorShape));
+
+  // Output: L1 RowMajor HeightSharded layout (incompatible with DRAM Tiled)
+  auto outputLayout = createRowMajorHSLayout(tensorShape, BufferType::L1,
+                                             TensorMemoryLayout::HeightSharded);
+  auto outputTensorType = mlir::RankedTensorType::get(
+      tensorShape, builder.getBF16Type(), outputLayout);
+
+  // Create ToLayoutOp with incompatible input/output layouts
+  auto toLayoutOp = builder.create<ToLayoutOp>(
+      builder.getUnknownLoc(), outputTensorType, input.getResult());
+
+  auto layouts = ttnn::utils::extractInputLayouts(toLayoutOp);
+  OpConfig config(outputLayout, OpConfig::OpSpecificAttrs{});
+
+  // Expected error message contains:
+  // tt-metal/ttnn/core/tensor/layout/tensor_layout.cpp:111:
+  // (physical_shard_shape.height() % tile_shape[0] == 0 &&
+  // physical_shard_shape.width() % tile_shape[1] == 0)
+  // info: Physical shard shape (1, 1024) must be tile {32, 32} sized!
+  auto result =
+      op_constraint_validation::validateOperation(toLayoutOp, layouts, config);
+
+  // Should return MetalBackendError due to incompatible layouts
+  EXPECT_EQ(result.status,
+            op_constraint_validation::ValidationStatus::MetalBackendError);
+  EXPECT_TRUE(result.isError());
+  EXPECT_FALSE(result.isSuccess());
+  EXPECT_FALSE(result.isNotImplemented());
+  EXPECT_FALSE(result.errorMessage.empty());
+}
+
+// Test ValidationStatus::OutOfMemoryError
+// Use restrictive L1 usage cap to trigger out of memory error
+TEST_F(OpConstraintValidationTest, ValidationStatusOutOfMemoryError) {
+  llvm::SmallVector<int64_t> largeShape = {1, 1, 512, 512};
+  auto layout = createTiledLayout(largeShape, BufferType::L1,
+                                  TensorMemoryLayout::Interleaved);
+  auto tensorType =
+      mlir::RankedTensorType::get(largeShape, builder.getBF16Type(), layout);
+
+  auto input1 = builder.create<OnesOp>(builder.getUnknownLoc(), tensorType,
+                                       /*device=*/nullptr,
+                                       ShapeAttr::get(&context, largeShape));
+
+  auto input2 = builder.create<OnesOp>(builder.getUnknownLoc(), tensorType,
+                                       /*device=*/nullptr,
+                                       ShapeAttr::get(&context, largeShape));
+
+  auto addOp = builder.create<AddOp>(builder.getUnknownLoc(), tensorType,
+                                     input1.getResult(), input2.getResult());
+
+  auto layouts = ttnn::utils::extractInputLayouts(addOp);
+  OpConfig config(layout, OpConfig::OpSpecificAttrs{});
+
+  // Set very restrictive L1 usage cap (0.1% of L1) to trigger OOM
+  setL1UsageCap(0.001f);
+
+  auto result =
+      op_constraint_validation::validateOperation(addOp, layouts, config);
+
+  // Should return OutOfMemoryError
+  EXPECT_EQ(result.status,
+            op_constraint_validation::ValidationStatus::OutOfMemoryError);
+  EXPECT_TRUE(result.isError());
+  EXPECT_FALSE(result.isSuccess());
+  EXPECT_FALSE(result.isNotImplemented());
+  EXPECT_FALSE(result.errorMessage.empty());
+}
+
+// Test ValidationStatus::UnmatchedReferenceConfig
+// Use validateWithMultipleAttributes with non-matching reference configs
+TEST_F(OpConstraintValidationTest, ValidationStatusUnmatchedReferenceConfig) {
+  auto addOp = createMockAddOp();
+  auto layouts = ttnn::utils::extractInputLayouts(addOp);
+
+  // Test config with L1 Interleaved layout
+  std::vector<OpConfig> testConfigs;
+  llvm::SmallVector<int64_t> shape = {1, 1, 32, 32};
+  auto testLayout =
+      createTiledLayout(shape, BufferType::L1, TensorMemoryLayout::Interleaved);
+  testConfigs.emplace_back(testLayout, OpConfig::OpSpecificAttrs{});
+
+  // Reference config with DRAM layout (won't match L1 output)
+  std::vector<OpConfig> referenceConfigs;
+  auto refLayout = createTiledLayout(shape, BufferType::DRAM,
+                                     TensorMemoryLayout::Interleaved);
+  referenceConfigs.emplace_back(refLayout, OpConfig::OpSpecificAttrs{});
+
+  auto results = op_constraint_validation::validateWithMultipleAttributes(
+      addOp, layouts, testConfigs, referenceConfigs);
+
+  // Should have one result
+  ASSERT_EQ(results.size(), 1);
+
+  const auto &result = results[0];
+  // Should return UnmatchedReferenceConfig when output layout doesn't match
+  // reference
+  EXPECT_EQ(
+      result.status,
+      op_constraint_validation::ValidationStatus::UnmatchedReferenceConfig);
+  EXPECT_TRUE(result.isError());
+  EXPECT_FALSE(result.isSuccess());
+  EXPECT_FALSE(result.errorMessage.empty());
+}

@@ -1,0 +1,1087 @@
+// SPDX-FileCopyrightText: (c) 2024 Tenstorrent AI ULC
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#include <optional>
+#include <variant>
+
+#include "tracy/Tracy.hpp"
+#include "tt-metalium/allocator.hpp"
+#include "tt-metalium/experimental/fabric/fabric.hpp"
+#include "tt/runtime/detail/common/common.h"
+#include "tt/runtime/detail/common/dylib.h"
+#include "tt/runtime/detail/common/logger.h"
+#include "tt/runtime/detail/common/runtime_context.h"
+#include "tt/runtime/detail/ttmetal/ttmetal.h"
+#include "tt/runtime/runtime.h"
+#include "tt/runtime/types.h"
+#include "tt/runtime/utils.h"
+#include "ttmlir/Target/TTMetal/Target.h"
+#include "ttmlir/Version.h"
+
+#include "executor.h"
+
+namespace tt::runtime::ttmetal {
+
+namespace target = ::tt::target;
+namespace tt_metal = ::tt::tt_metal;
+
+static const target::metal::TTMetalBinary *getBinary(Flatbuffer binary) {
+  bool isTTMetal = target::metal::SizePrefixedTTMetalBinaryBufferHasIdentifier(
+      binary.handle.get());
+  if (!isTTMetal) {
+    LOG_FATAL("Unsupported binary format");
+  }
+  return target::metal::GetSizePrefixedTTMetalBinary(binary.handle.get());
+}
+
+Layout getLayout(Binary executableHandle, std::uint32_t programIndex,
+                 std::uint32_t inputIndex) {
+  // TODO(#3126): Implement device copy toLayout for metal runtime
+  return Layout(nullptr, DeviceRuntime::TTMetal);
+}
+
+Tensor toLayout(Tensor tensor, Device, Layout layout, std::optional<bool>) {
+  std::visit(
+      utils::overloaded{
+          [&](const std::uint32_t &) { LOG_FATAL("Unsupported variant type"); },
+          // TODO(#3126): Implement device copy toLayout for metal runtime.
+          [&](const TensorDesc &) {},
+          [&](const HostBuffer &) {
+            LOG_FATAL("toLayout not yet implemented for HostBuffer");
+          },
+          [&](const DistributedHostBuffer &) {
+            LOG_FATAL("toLayout not yet implemented for DistributedHostBuffer");
+          },
+          [&](const MeshBuffer &) {
+            LOG_FATAL("getTensorDesc from MeshBuffer not supported.");
+          },
+      },
+      tensor.as<MetalTensor>(DeviceRuntime::TTMetal));
+  return tensor;
+}
+
+static MemoryView
+createMemoryView(const tt_metal::detail::MemoryView &memoryView) {
+  return MemoryView{
+      .numBanks = memoryView.num_banks,
+      .totalBytesPerBank = memoryView.total_bytes_per_bank,
+      .totalBytesAllocatedPerBank = memoryView.total_bytes_allocated_per_bank,
+      .totalBytesFreePerBank = memoryView.total_bytes_free_per_bank,
+      .largestContiguousBytesFreePerBank =
+          memoryView.largest_contiguous_bytes_free_per_bank,
+      .blockTable = memoryView.block_table,
+  };
+}
+
+Tensor createBorrowedHostTensor(std::shared_ptr<void> data,
+                                const TensorDesc &desc) {
+  LOG_ASSERT(utils::isSupportedDataType(desc.dataType),
+             "Creating owned tensor with unsupported data type: " +
+                 std::string(target::EnumNameDataType(desc.dataType)) +
+                 "is not implemented for the TTMetal runtime");
+  std::shared_ptr<MetalTensor> handle = std::make_shared<MetalTensor>(desc);
+  return Tensor(static_pointer_cast<void>(handle), data,
+                DeviceRuntime::TTMetal);
+}
+
+std::shared_ptr<tt_metal::HostBuffer>
+createMetalHostBuffer(const void *data, const std::vector<std::uint32_t> &shape,
+                      const size_t sizeBytes,
+                      const ::tt::target::DataType dataType) {
+  const std::uint64_t shapeVolume = utils::product(shape.begin(), shape.end());
+
+  auto createTypedHostBuffer = [&]<typename T>() {
+    auto paddedShapeVolume = sizeBytes / sizeof(T);
+    LOG_ASSERT(paddedShapeVolume >= shapeVolume,
+               "Padded volume must be greater than or equal to volume");
+    auto owned = std::make_shared<std::vector<T>>(paddedShapeVolume);
+    std::memcpy(owned->data(), data, sizeBytes);
+    return std::make_shared<tt_metal::HostBuffer>(owned);
+  };
+
+  std::shared_ptr<tt_metal::HostBuffer> hostBuffer;
+  switch (dataType) {
+  case ::tt::target::DataType::Float32:
+    hostBuffer = createTypedHostBuffer.template operator()<float>();
+    break;
+  case ::tt::target::DataType::BFloat16:
+    hostBuffer = createTypedHostBuffer.template operator()<bfloat16>();
+    break;
+  case ::tt::target::DataType::UInt32:
+    hostBuffer = createTypedHostBuffer.template operator()<uint32_t>();
+    break;
+  case ::tt::target::DataType::UInt16:
+    hostBuffer = createTypedHostBuffer.template operator()<uint16_t>();
+    break;
+  case ::tt::target::DataType::UInt8:
+    hostBuffer = createTypedHostBuffer.template operator()<uint8_t>();
+    break;
+  case ::tt::target::DataType::Int32:
+    hostBuffer = createTypedHostBuffer.template operator()<int32_t>();
+    break;
+  default:
+    LOG_FATAL("Unsupported data type");
+  }
+
+  return hostBuffer;
+}
+
+Tensor createOwnedHostTensor(const void *data,
+                             const std::vector<std::uint32_t> &shape,
+                             const std::vector<std::int64_t> &stride,
+                             std::uint32_t itemsize,
+                             ::tt::target::DataType dataType) {
+  LOG_ASSERT(utils::isSupportedDataType(dataType),
+             "Creating owned tensor with unsupported data type: " +
+                 std::string(target::EnumNameDataType(dataType)) +
+                 "is not implemented for the TTMetal runtime");
+
+  const std::int64_t sizeBytes = std::accumulate(shape.begin(), shape.end(),
+                                                 static_cast<int64_t>(itemsize),
+                                                 std::multiplies<int64_t>());
+
+  auto hostBuffer = createMetalHostBuffer(data, shape, sizeBytes, dataType);
+  return Tensor(std::static_pointer_cast<void>(hostBuffer), nullptr,
+                DeviceRuntime::TTMetal);
+}
+
+Tensor createMultiDeviceHostTensor(
+    const std::vector<Tensor> &tensorShards,
+    const std::unordered_map<std::string, std::string> &strategy,
+    const std::vector<uint32_t> &meshShape) {
+  std::vector<tt_metal::HostBuffer> hostBuffers;
+  hostBuffers.reserve(tensorShards.size());
+  std::transform(
+      tensorShards.begin(), tensorShards.end(), std::back_inserter(hostBuffers),
+      [&](Tensor tensorShard) -> tt_metal::HostBuffer {
+        return tensorShard.as<tt_metal::HostBuffer>(DeviceRuntime::TTMetal);
+      });
+  auto metalMeshShape = tt_metal::distributed::MeshShape(meshShape);
+
+  // For now, we only focus on a single host.
+  auto distributedHostBuffer =
+      std::make_shared<tt_metal::DistributedHostBuffer>(
+          tt_metal::DistributedHostBuffer::create(metalMeshShape));
+
+  auto meshCoordRange =
+      tt_metal::distributed::MeshCoordinateRange(metalMeshShape);
+  auto meshCoord = meshCoordRange.begin();
+  for (auto hostBuffer : hostBuffers) {
+    // HostBuffer is to be placed in row-major order.
+    distributedHostBuffer->emplace_shard(
+        *meshCoord, [&hostBuffer]() { return hostBuffer; });
+    meshCoord++;
+  }
+
+  return Tensor(std::static_pointer_cast<void>(distributedHostBuffer), nullptr,
+                DeviceRuntime::TTMetal);
+}
+
+Tensor createMultiDeviceHostTensor(
+    const std::vector<const void *> &data,
+    const std::vector<std::uint32_t> &shape,
+    const std::vector<std::int64_t> &stride, std::uint32_t itemsize,
+    ::tt::target::DataType dataType,
+    const std::unordered_map<std::string, std::string> &strategy,
+    const std::vector<uint32_t> &meshShape) {
+  std::vector<Tensor> tensorShards;
+  tensorShards.reserve(data.size());
+  std::transform(data.begin(), data.end(), std::back_inserter(tensorShards),
+                 [&](const void *dataShard) -> Tensor {
+                   return createOwnedHostTensor(dataShard, shape, stride,
+                                                itemsize, dataType);
+                 });
+  return ttmetal::createMultiDeviceHostTensor(tensorShards, strategy,
+                                              meshShape);
+}
+
+Tensor createMultiDeviceBorrowedHostTensor(
+    std::vector<void *> &data, const std::vector<std::uint32_t> &shape,
+    const std::vector<std::int64_t> &stride, std::uint32_t itemsize,
+    ::tt::target::DataType dataType,
+    const std::unordered_map<std::string, std::string> &strategy,
+    const std::vector<uint32_t> &meshShape) {
+  LOG_FATAL(
+      "createMultiDeviceBorrowedHostTensor not implemented for metal runtime");
+}
+
+template <typename T>
+static Tensor createScalarTensorImpl(T scalar) {
+  static_assert(sizeof(T) <= sizeof(std::uint32_t));
+  std::uint32_t scalarPacked = 0;
+  std::memcpy(&scalarPacked, &scalar, sizeof(T));
+  std::shared_ptr<MetalTensor> handle =
+      std::make_shared<MetalTensor>(scalarPacked);
+  return Tensor(static_pointer_cast<void>(handle), nullptr,
+                DeviceRuntime::TTMetal);
+}
+
+Tensor createScalarTensor(Scalar scalar) {
+  return std::visit(
+      utils::overloaded{
+          [&](const uint32_t &s) { return createScalarTensorImpl(s); },
+          [&](const int32_t &s) { return createScalarTensorImpl(s); },
+          [&](const uint16_t &s) { return createScalarTensorImpl(s); },
+          [&](const int16_t &s) { return createScalarTensorImpl(s); },
+          [&](const uint8_t &s) { return createScalarTensorImpl(s); },
+          [&](const int8_t &s) { return createScalarTensorImpl(s); },
+          [&](const bool &s) { return createScalarTensorImpl(s); },
+          [&](const float &s) { return createScalarTensorImpl(s); },
+      },
+      scalar);
+}
+
+bool isTensorAllocated(Tensor tensor) {
+  LOG_FATAL("isTensorAllocated not implemented for metal runtime");
+}
+
+target::DataType getTensorDataType(Tensor tensor) {
+  const MetalTensor &metalTensor =
+      tensor.as<MetalTensor>(DeviceRuntime::TTMetal);
+  return std::visit(
+      utils::overloaded{
+          [&](const std::uint32_t &) {
+            LOG_FATAL("Unsupported variant type");
+            return target::DataType::Float32;
+          },
+          [&](const TensorDesc &desc) { return desc.dataType; },
+          [&](const HostBuffer &buffer) {
+            LOG_FATAL("Datatype mapping from HostBuffer not supported yet.");
+            return target::DataType::Float32;
+          },
+          [&](const DistributedHostBuffer &buffer) {
+            LOG_FATAL("Datatype mapping from DistributedHostBuffer not "
+                      "supported yet.");
+            return target::DataType::Float32;
+          },
+          [&](const MeshBuffer &buffer) {
+            LOG_FATAL("Datatype mapping from MeshBuffer not supported yet.");
+            return target::DataType::Float32;
+          },
+      },
+      metalTensor);
+}
+
+bool getTensorRetain(Tensor tensor) {
+  LOG_FATAL("getTensorRetain not implemented for metal runtime");
+}
+
+void setTensorRetain(Tensor tensor, bool retain) {
+  LOG_FATAL("setTensorRetain not implemented for metal runtime");
+}
+
+tt::target::Arch getArch() {
+  return ::tt::runtime::common::toTargetArch(::tt::tt_metal::hal::get_arch());
+}
+
+size_t getNumAvailableDevices() { return tt_metal::GetNumAvailableDevices(); }
+
+Device openMeshDevice(const MeshDeviceOptions &options) {
+  std::optional<tt_metal::distributed::MeshShape> meshShape = std::nullopt;
+  if (options.meshShape.has_value()) {
+    LOG_ASSERT(options.meshShape.value().size() == 2,
+               "Mesh shape must be 2D for now");
+    meshShape = tt_metal::distributed::MeshShape(options.meshShape.value());
+  }
+
+  LOG_ASSERT(options.meshOffset.size() == 2, "Mesh offset must be 2D for now");
+  tt_metal::distributed::MeshCoordinate offset(options.meshOffset);
+
+  size_t l1SmallSize = options.l1SmallSize.value_or(DEFAULT_L1_SMALL_SIZE);
+  size_t traceRegionSize =
+      options.traceRegionSize.value_or(DEFAULT_TRACE_REGION_SIZE);
+  tt_metal::DispatchCoreType dispatchCoreType =
+      common::getDispatchCoreType(options.dispatchCoreType);
+
+  tt_metal::distributed::MeshDeviceConfig meshConfig(meshShape, offset,
+                                                     options.deviceIds);
+
+  std::shared_ptr<tt_metal::distributed::MeshDevice> meshDevice =
+      tt_metal::distributed::MeshDevice::create(
+          meshConfig, l1SmallSize, traceRegionSize, options.numHWCQs,
+          dispatchCoreType);
+
+  LOG_DEBUG("Device grid size = { ",
+            meshDevice->compute_with_storage_grid_size().x, ", ",
+            meshDevice->compute_with_storage_grid_size().y, " }");
+
+  return Device(std::static_pointer_cast<void>(meshDevice),
+                /*traceCache=*/nullptr, DeviceRuntime::TTMetal);
+}
+
+void closeMeshDevice(Device parentMesh) {
+  tt_metal::distributed::MeshDevice &metalMeshDevice =
+      parentMesh.as<tt_metal::distributed::MeshDevice>(DeviceRuntime::TTMetal);
+
+  LOG_ASSERT(metalMeshDevice.is_parent_mesh(),
+             "Mesh device must be a parent mesh");
+
+  uint32_t numUnreleasedSubMeshes = 0;
+  for (const auto &subMesh : metalMeshDevice.get_submeshes()) {
+    if (subMesh->is_initialized()) {
+      numUnreleasedSubMeshes++;
+    }
+  }
+  if (numUnreleasedSubMeshes > 0) {
+    LOG_WARNING("Calling close on parent mesh device ", metalMeshDevice,
+                " that has ", numUnreleasedSubMeshes,
+                " unreleased submeshes."
+                "These submeshes will keep the parent mesh device alive. "
+                "To fully close the parent mesh device, please release all of "
+                "its submeshes.");
+  }
+
+#if defined(TT_RUNTIME_ENABLE_PERF_TRACE) && TT_RUNTIME_ENABLE_PERF_TRACE == 1
+  ::tt::tt_metal::ReadMeshDeviceProfilerResults(metalMeshDevice);
+#endif
+
+  metalMeshDevice.close();
+}
+
+Device createSubMeshDevice(
+    Device parentMesh, const std::vector<uint32_t> &meshShape,
+    const std::optional<const std::vector<uint32_t>> &meshOffset) {
+  tt_metal::distributed::MeshDevice &parentMeshDevice =
+      parentMesh.as<tt_metal::distributed::MeshDevice>(DeviceRuntime::TTMetal);
+  LOG_ASSERT(parentMeshDevice.is_parent_mesh(),
+             "Mesh device must be a parent mesh");
+  LOG_ASSERT(meshShape.size() == 2, "Mesh shape must be 2D for now");
+  tt_metal::distributed::MeshShape shape{meshShape[0], meshShape[1]};
+
+  std::optional<tt_metal::distributed::MeshCoordinate> offset = std::nullopt;
+  if (meshOffset.has_value()) {
+    LOG_ASSERT(meshOffset.value().size() == 2,
+               "Mesh offset must be 2D for now");
+    offset = tt_metal::distributed::MeshCoordinate{meshOffset.value()[0],
+                                                   meshOffset.value()[1]};
+  }
+
+  std::shared_ptr<tt_metal::distributed::MeshDevice> subMeshDevice =
+      parentMeshDevice.create_submesh(shape, offset);
+
+  return Device(std::static_pointer_cast<void>(subMeshDevice),
+                /*traceCache=*/nullptr, DeviceRuntime::TTMetal);
+}
+
+void releaseSubMeshDevice(Device subMesh) {
+  tt_metal::distributed::MeshDevice &metalMeshDevice =
+      subMesh.as<tt_metal::distributed::MeshDevice>(DeviceRuntime::TTMetal);
+
+  LOG_ASSERT(!metalMeshDevice.is_parent_mesh(),
+             "Mesh device must be a submesh");
+
+  metalMeshDevice.close();
+  subMesh.handle.reset();
+}
+
+void reshapeMeshDevice(Device meshDevice,
+                       const std::vector<uint32_t> &meshShape) {
+  ::tt::tt_metal::distributed::MeshDevice &metalMeshDevice =
+      meshDevice.as<::tt::tt_metal::distributed::MeshDevice>(
+          DeviceRuntime::TTMetal);
+
+  metalMeshDevice.reshape(
+      ::tt::tt_metal::distributed::MeshShape(meshShape[0], meshShape[1]));
+}
+
+std::vector<uint32_t> getMeshShape(Device meshDevice) {
+  ::tt::tt_metal::distributed::MeshDevice &metalMeshDevice =
+      meshDevice.as<::tt::tt_metal::distributed::MeshDevice>(
+          DeviceRuntime::TTMetal);
+  std::vector<uint32_t> shape(metalMeshDevice.shape().view().begin(),
+                              metalMeshDevice.shape().view().end());
+  return shape;
+}
+
+std::vector<int> getDeviceIds(Device meshDevice) {
+  ::tt::tt_metal::distributed::MeshDevice &metalMeshDevice =
+      meshDevice.as<::tt::tt_metal::distributed::MeshDevice>(
+          DeviceRuntime::TTMetal);
+  return metalMeshDevice.get_device_ids();
+}
+
+size_t getNumHwCqs(Device meshDevice) {
+  ::tt::tt_metal::distributed::MeshDevice &metalMeshDevice =
+      meshDevice.as<::tt::tt_metal::distributed::MeshDevice>(
+          DeviceRuntime::TTMetal);
+  return static_cast<size_t>(metalMeshDevice.num_hw_cqs());
+}
+
+bool isProgramCacheEnabled(Device meshDevice) {
+  ::tt::tt_metal::distributed::MeshDevice &metalMeshDevice =
+      meshDevice.as<::tt::tt_metal::distributed::MeshDevice>(
+          DeviceRuntime::TTMetal);
+  return metalMeshDevice.get_program_cache().is_enabled();
+}
+
+void clearProgramCache(Device meshDevice) {
+  ::tt::tt_metal::distributed::MeshDevice &metalMeshDevice =
+      meshDevice.as<::tt::tt_metal::distributed::MeshDevice>(
+          DeviceRuntime::TTMetal);
+  return metalMeshDevice.clear_program_cache();
+}
+
+size_t getL1SmallSize(Device meshDevice) {
+  ::tt::tt_metal::distributed::MeshDevice &metalMeshDevice =
+      meshDevice.as<::tt::tt_metal::distributed::MeshDevice>(
+          DeviceRuntime::TTMetal);
+  return metalMeshDevice.allocator()
+      ->get_statistics(::tt::tt_metal::BufferType::L1_SMALL)
+      .total_allocatable_size_bytes;
+}
+
+size_t getTraceRegionSize(Device meshDevice) {
+  ::tt::tt_metal::distributed::MeshDevice &metalMeshDevice =
+      meshDevice.as<::tt::tt_metal::distributed::MeshDevice>(
+          DeviceRuntime::TTMetal);
+  return metalMeshDevice.allocator()
+      ->get_statistics(::tt::tt_metal::BufferType::TRACE)
+      .total_allocatable_size_bytes;
+}
+
+size_t getNumDramChannels(Device meshDevice) {
+  ::tt::tt_metal::distributed::MeshDevice &metalMeshDevice =
+      meshDevice.as<::tt::tt_metal::distributed::MeshDevice>(
+          DeviceRuntime::TTMetal);
+  return metalMeshDevice.num_dram_channels();
+}
+
+size_t getDramSizePerChannel(Device meshDevice) {
+  ::tt::tt_metal::distributed::MeshDevice &metalMeshDevice =
+      meshDevice.as<::tt::tt_metal::distributed::MeshDevice>(
+          DeviceRuntime::TTMetal);
+  return metalMeshDevice.dram_size_per_channel();
+}
+
+size_t getL1SizePerCore(Device meshDevice) {
+  ::tt::tt_metal::distributed::MeshDevice &metalMeshDevice =
+      meshDevice.as<::tt::tt_metal::distributed::MeshDevice>(
+          DeviceRuntime::TTMetal);
+  return metalMeshDevice.l1_size_per_core();
+}
+
+void deallocateBuffers(Device deviceHandle) {
+  tt_metal::distributed::MeshDevice &meshDevice =
+      deviceHandle.as<tt_metal::distributed::MeshDevice>(
+          DeviceRuntime::TTMetal);
+
+  for (tt_metal::IDevice *device : meshDevice.get_devices()) {
+    device->allocator()->deallocate_buffers();
+  }
+}
+
+void dumpMemoryReport(Device deviceHandle) {
+  tt_metal::distributed::MeshDevice &meshDevice =
+      deviceHandle.as<tt_metal::distributed::MeshDevice>(
+          DeviceRuntime::TTMetal);
+
+  for (tt_metal::IDevice *device : meshDevice.get_devices()) {
+    tt_metal::detail::DumpDeviceMemoryState(device);
+  }
+}
+
+void readDeviceProfilerResults(Device deviceHandle) {
+  tt_metal::distributed::MeshDevice &metalMeshDevice =
+      deviceHandle.as<tt_metal::distributed::MeshDevice>(
+          DeviceRuntime::TTMetal);
+
+  LOG_ASSERT(metalMeshDevice.is_parent_mesh(),
+             "Mesh device must be a parent mesh");
+
+#if defined(TT_RUNTIME_ENABLE_PERF_TRACE)
+  ::tt::tt_metal::ReadMeshDeviceProfilerResults(metalMeshDevice);
+#endif
+}
+
+std::unordered_map<MemoryBufferType, MemoryView>
+getMemoryView(Device deviceHandle) {
+  std::unordered_map<MemoryBufferType, MemoryView> memoryMap;
+  tt_metal::distributed::MeshDevice &meshDevice =
+      deviceHandle.as<tt_metal::distributed::MeshDevice>(
+          DeviceRuntime::TTMetal);
+
+  auto dramMemoryView =
+      tt_metal::detail::GetMemoryView(&meshDevice, tt_metal::BufferType::DRAM);
+  auto l1MemoryView =
+      tt_metal::detail::GetMemoryView(&meshDevice, tt_metal::BufferType::L1);
+  auto l1SmallMemoryView = tt_metal::detail::GetMemoryView(
+      &meshDevice, tt_metal::BufferType::L1_SMALL);
+  auto traceMemoryView =
+      tt_metal::detail::GetMemoryView(&meshDevice, tt_metal::BufferType::TRACE);
+
+  memoryMap[MemoryBufferType::DRAM] = createMemoryView(dramMemoryView);
+  memoryMap[MemoryBufferType::L1] = createMemoryView(l1MemoryView);
+  memoryMap[MemoryBufferType::L1_SMALL] = createMemoryView(l1SmallMemoryView);
+  memoryMap[MemoryBufferType::TRACE] = createMemoryView(traceMemoryView);
+
+  return memoryMap;
+}
+
+void setFabricConfig(tt::runtime::FabricConfig config) {
+  ::tt::tt_fabric::SetFabricConfig(common::toMetalFabricConfig(config));
+  RuntimeContext::instance().setCurrentFabricConfig(config);
+}
+
+void wait(Event event) {
+  std::shared_ptr<tt_metal::distributed::MeshEvent> eventPtr =
+      event.asSharedPtr<tt_metal::distributed::MeshEvent>(
+          DeviceRuntime::TTMetal);
+  if (eventPtr) {
+    tt_metal::distributed::EventSynchronize(*eventPtr);
+  }
+}
+
+void wait(Tensor tensor, std::optional<uint8_t> cqId) {
+  ::tt::runtime::ttmetal::wait(tensor.event);
+}
+
+void wait(const std::vector<Tensor> &tensors, std::optional<uint8_t> cqId) {
+  for (Tensor tensor : tensors) {
+    ::tt::runtime::ttmetal::wait(tensor);
+  }
+}
+
+uint32_t getNumShards(Tensor tensor) {
+  return std::visit(
+      utils::overloaded{
+          [&](const std::uint32_t &) -> uint32_t {
+            LOG_FATAL("Unsupported variant type");
+          },
+          [&](const TensorDesc &) -> uint32_t { return 1; },
+          [&](const HostBuffer &) -> uint32_t { return 1; },
+          [&](const DistributedHostBuffer &buffer) -> uint32_t {
+            // Count populated shards.
+            return static_cast<uint32_t>(buffer->shard_coords().size());
+          },
+          [&](const MeshBuffer &buffer) -> uint32_t {
+            // MeshBuffer spans the full mesh shape.
+            return static_cast<uint32_t>(buffer->device()->shape().mesh_size());
+          },
+      },
+      tensor.as<MetalTensor>(DeviceRuntime::TTMetal));
+}
+
+std::vector<Tensor> toHost(Tensor tensor, bool untilize, bool blocking) {
+  ::tt::runtime::ttmetal::wait(tensor);
+  std::visit(
+      utils::overloaded{
+          [&](const std::uint32_t &) { LOG_FATAL("Unsupported variant type"); },
+          [&](const TensorDesc &) { /* no-op */ },
+          [&](const HostBuffer &) { /* no-op */ },
+          [&](const DistributedHostBuffer &) {
+            LOG_FATAL("toHost not yet implemented for DistributedHostBuffer");
+          },
+          [&](const MeshBuffer &) {
+            LOG_FATAL("toHost not yet implemented for MeshBuffer");
+          },
+      },
+      tensor.as<MetalTensor>(DeviceRuntime::TTMetal));
+  return {tensor};
+}
+
+template <typename T>
+static std::vector<T> getStridedRowStartIndices(const std::vector<T> &shape,
+                                                const std::vector<T> &strides,
+                                                const size_t dim = 0) {
+  const T dimSize = shape[dim];
+
+  // Base case.
+  if (dim == shape.size() - 1) {
+    // A single row always start at index 0.
+    return std::vector<T>{0};
+  }
+
+  // Recursive case.
+  // 1. Get the indices of all the rows of a single slice of the current dim.
+  const auto sliceIndices = getStridedRowStartIndices(shape, strides, dim + 1);
+  const size_t sliceRows = sliceIndices.size();
+  // 2. Generate indices for all the slices of the current dim.
+  std::vector<T> indices(sliceRows * dimSize);
+  // 3. The distance between the start of the first row of two neighboring
+  // slices is the size of the slice, i.e. the stride of the current dim.
+  for (T i = 0; i < dimSize; i++) {
+    const T offset = i * strides[dim];
+    for (size_t j = 0; j < sliceRows; j++) {
+      indices[i * sliceRows + j] = sliceIndices[j] + offset;
+    }
+  }
+  return indices;
+}
+
+static void stridedMemcpy(const TensorDesc &dst, const TensorDesc &src,
+                          void *dstData, const void *srcData) {
+  LOG_ASSERT(dst.shape == src.shape, "Tensor shape mismatch");
+  LOG_ASSERT(dst.elementSize() == src.elementSize(),
+             "Tensor item size mismatch");
+
+  // `getStridedRowStartIndices` requires `shape` and `stride` to share the same
+  // element type. `stride` is signed `int64`, so widen `shape` to `int64`
+  // (lossless) rather than narrowing the stride.
+  const auto srcIndices = getStridedRowStartIndices(
+      std::vector<std::int64_t>(src.shape.begin(), src.shape.end()),
+      src.stride);
+  const auto dstIndices = getStridedRowStartIndices(
+      std::vector<std::int64_t>(dst.shape.begin(), dst.shape.end()),
+      dst.stride);
+  assert(srcIndices.size() == dstIndices.size());
+  assert(srcIndices.size() ==
+         utils::product(src.shape.cbegin(), src.shape.cend() - 1));
+
+  const size_t elemSize = src.elementSize();
+  const size_t rowSize = src.shape[src.shape.size() - 1] * elemSize;
+  const std::byte *srcPtr = static_cast<const std::byte *>(srcData);
+  std::byte *dstPtr = static_cast<std::byte *>(dstData);
+  for (size_t i = 0; i < srcIndices.size(); i++) {
+    std::memcpy(dstPtr + dstIndices[i] * elemSize,
+                srcPtr + srcIndices[i] * elemSize, rowSize);
+  }
+}
+
+void memcpy(void *dst, Tensor src,
+            std::optional<tt::target::DataType> dstDataType) {
+  if (dstDataType.has_value()) {
+    LOG_ASSERT(
+        ::tt::runtime::utils::isSupportedDataType(dstDataType.value()),
+        "dstDataType must be a supported data type if using TTMetal runtime");
+  }
+  std::visit(
+      utils::overloaded{
+          [&](const std::uint32_t &) { LOG_FATAL("Unsupported variant type"); },
+          [&](const TensorDesc &tensorDesc) {
+            std::memcpy(dst, src.data.get(), tensorDesc.sizeBytes());
+          },
+          [&](const HostBuffer &hostBuffer) {
+            auto span = hostBuffer->view_bytes();
+            std::memcpy(dst, span.data(), span.size_bytes());
+          },
+          [&](const DistributedHostBuffer &) {
+            LOG_FATAL("memcpy not yet implemented for DistributedHostBuffer");
+          },
+          [&](const MeshBuffer &) {
+            LOG_FATAL("memcpy not yet implemented for MeshBuffer");
+          },
+      },
+      src.as<MetalTensor>(DeviceRuntime::TTMetal));
+}
+
+void memcpy(Tensor dst, Tensor src) {
+  auto &metalDst = dst.as<MetalTensor>(DeviceRuntime::TTMetal);
+  auto &dstDesc = std::get<TensorDesc>(metalDst);
+  std::visit(
+      utils::overloaded{
+          [&](const std::uint32_t &) { LOG_FATAL("Unsupported variant type"); },
+          [&](const TensorDesc &srcDesc) {
+            memcpy(dst, dstDesc, src, srcDesc);
+          },
+          [&](const HostBuffer &hostBuffer) {
+            auto span = hostBuffer->view_bytes();
+            size_t copyByteSize =
+                std::min(dstDesc.sizeBytes(), span.size_bytes());
+            std::memcpy(dst.data.get(), span.data(), copyByteSize);
+          },
+          [&](const DistributedHostBuffer &) {
+            LOG_FATAL("memcpy not yet implemented for DistributedHostBuffer");
+          },
+          [&](const MeshBuffer &) {
+            LOG_FATAL("memcpy not yet implemented for MeshBuffer");
+          },
+      },
+      src.as<MetalTensor>(DeviceRuntime::TTMetal));
+}
+
+void memcpy(Tensor dst, TensorDesc dstDesc, Tensor src, TensorDesc srcDesc) {
+  LOG_ASSERT(dstDesc.dataType == srcDesc.dataType, "Tensor data type mismatch");
+  // Allow rank mismatch for reshape-style copies (e.g. [128] -> [1,128]) when
+  // total byte size matches and both tensors are contiguous.
+  if (dstDesc.shape.size() != srcDesc.shape.size()) {
+    LOG_ASSERT(dstDesc.sizeBytes() == srcDesc.sizeBytes(),
+               "Tensor size mismatch for rank-changing copy");
+    LOG_ASSERT(!dstDesc.isPadded() && !srcDesc.isPadded(),
+               "Padded tensors with different ranks not supported for memcpy");
+  }
+  void *singleDeviceTensorPtr = nullptr;
+  std::visit(
+      utils::overloaded{
+          [&](const std::uint32_t &) { LOG_FATAL("Unsupported variant type"); },
+          [&](const TensorDesc &srcDesc) {
+            singleDeviceTensorPtr = src.data.get();
+          },
+          [&](const HostBuffer &hostBuffer) {
+            singleDeviceTensorPtr = hostBuffer->view_bytes().data();
+          },
+          [&](const auto &) {},
+      },
+      src.as<MetalTensor>(DeviceRuntime::TTMetal));
+
+  auto memcpy_fn = [&](void *dst, void *src) {
+    if (dstDesc.isPadded() || srcDesc.isPadded()) {
+      ttmetal::stridedMemcpy(dstDesc, srcDesc, dst, src);
+    } else {
+      size_t copySize = std::min(dstDesc.sizeBytes(), srcDesc.sizeBytes());
+      std::memcpy(dst, src, copySize);
+    }
+  };
+
+  std::visit(
+      utils::overloaded{
+          [&](const std::uint32_t &) { LOG_FATAL("Unsupported variant type"); },
+          [&](const TensorDesc &tensorDesc) {
+            memcpy_fn(dst.data.get(), singleDeviceTensorPtr);
+          },
+          [&](const HostBuffer &hostBuffer) {
+            memcpy_fn(hostBuffer->view_bytes().data(), singleDeviceTensorPtr);
+          },
+          [&](const DistributedHostBuffer &dstDistributedHostBuffer) {
+            LOG_ASSERT(singleDeviceTensorPtr == nullptr);
+            auto srcDistributedHostBuffer = std::get<DistributedHostBuffer>(
+                src.as<MetalTensor>(DeviceRuntime::TTMetal));
+            for (const auto &coord : srcDistributedHostBuffer->shard_coords()) {
+              auto srcBuf = srcDistributedHostBuffer->get_shard(coord);
+              auto dstBuf = dstDistributedHostBuffer->get_shard(coord);
+              if (srcBuf.has_value() && dstBuf.has_value()) {
+                memcpy_fn(dstBuf->view_bytes().data(),
+                          srcBuf->view_bytes().data());
+              } else {
+                LOG_FATAL("srcBuf or dstBuf is null");
+              }
+            }
+          },
+          [&](const MeshBuffer &) {
+            LOG_FATAL("memcpy not yet implemented for MeshBuffer");
+          },
+      },
+      dst.as<MetalTensor>(DeviceRuntime::TTMetal));
+}
+
+void deallocateTensor(Tensor &tensor, bool) {
+  std::visit(
+      utils::overloaded{
+          [&](const std::uint32_t &) { LOG_FATAL("Unsupported variant type"); },
+          [&](const TensorDesc &) { /* no-op */ },
+          [&](const HostBuffer &) { /* no-op */ },
+          [&](const DistributedHostBuffer &) { /* no-op */ },
+          [&](const MeshBuffer &) {
+            LOG_FATAL("deallocateTensor not yet implemented for MeshBuffer");
+          },
+      },
+      tensor.as<MetalTensor>(DeviceRuntime::TTMetal));
+}
+
+std::string getOpDebugString(OpContext opContextHandle) {
+  // Not implemented
+  LOG_WARNING("obtaining op debug string for metal runtime not implemented");
+  return "";
+}
+
+std::string getOpLocInfo(OpContext opContextHandle) {
+  // Not implemented
+  LOG_WARNING("obtaining op location info for metal runtime not implemented");
+  return "";
+}
+
+std::unordered_map<std::uint32_t, Tensor>
+getOpOutputTensor(OpContext opContextHandle,
+                  CallbackContext programContextHandle) {
+  // Not implemented
+  LOG_WARNING("obtaining op output tensor for metal runtime not implemented");
+  return {};
+}
+
+std::optional<Tensor>
+retrieveTensorFromPool(CallbackContext programContextHandle,
+                       TensorRef tensorRef, bool untilize) {
+  // Not implemented
+  LOG_FATAL(
+      "Obtaining tensor from device for metal runtime is not implemented");
+  return std::nullopt;
+}
+
+void updateTensorInPool(CallbackContext programContextHandle,
+                        TensorRef tensorRef, Tensor srcTensor) {
+  // Not implemented
+  LOG_FATAL("Updating tensor from device for metal runtime is not implemented");
+}
+
+std::vector<std::byte> getTensorDataBuffer(Tensor tensor) {
+  return std::visit(
+      utils::overloaded{
+          [&](const std::uint32_t &) {
+            LOG_FATAL("Unsupported variant type");
+            return std::vector<std::byte>{};
+          },
+          [&](const TensorDesc &desc) {
+            const std::byte *data =
+                static_cast<const std::byte *>(tensor.data.get());
+            assert(data);
+            return std::vector<std::byte>(data, data + desc.sizeBytes());
+          },
+          [&](const HostBuffer &buffer) {
+            auto span = buffer->view_bytes();
+            return std::vector<std::byte>(span.begin(), span.end());
+          },
+          [&](const DistributedHostBuffer &buffer) {
+            LOG_FATAL("getTensorDataBuffer from DistributedHostBuffer not "
+                      "supported.");
+            return std::vector<std::byte>{};
+          },
+          [&](const MeshBuffer &buffer) {
+            LOG_FATAL("getTensorDataBuffer from MeshBuffer not supported.");
+            return std::vector<std::byte>{};
+          },
+      },
+      tensor.as<MetalTensor>(DeviceRuntime::TTMetal));
+}
+
+std::vector<std::uint32_t> getTensorShape(Tensor tensor) {
+  return std::visit(
+      utils::overloaded{
+          [&](const std::uint32_t &) {
+            LOG_FATAL("Unsupported variant type");
+            return std::vector<std::uint32_t>{};
+          },
+          [&](const TensorDesc &desc) {
+            return ttmetal::getTensorDesc(tensor).shape;
+          },
+          [&](const HostBuffer &buffer) {
+            LOG_FATAL("getTensorShape from HostBuffer not supported.");
+            return std::vector<std::uint32_t>{};
+          },
+          [&](const DistributedHostBuffer &buffer) {
+            LOG_FATAL(
+                "getTensorShape from DistributedHostBuffer not supported.");
+            return std::vector<std::uint32_t>{};
+          },
+          [&](const MeshBuffer &buffer) {
+            LOG_FATAL("getTensorShape from MeshBuffer not supported.");
+            return std::vector<std::uint32_t>{};
+          },
+      },
+      tensor.as<MetalTensor>(DeviceRuntime::TTMetal));
+}
+
+std::vector<std::int64_t> getTensorStride(Tensor tensor) {
+  return std::visit(
+      utils::overloaded{
+          [&](const std::uint32_t &) {
+            LOG_FATAL("Unsupported variant type");
+            return std::vector<std::int64_t>{};
+          },
+          [&](const TensorDesc &desc) {
+            return ttmetal::getTensorDesc(tensor).stride;
+          },
+          [&](const HostBuffer &buffer) {
+            LOG_FATAL("getTensorStride from HostBuffer not supported.");
+            return std::vector<std::int64_t>{};
+          },
+          [&](const DistributedHostBuffer &buffer) {
+            LOG_FATAL(
+                "getTensorStride from DistributedHostBuffer not supported.");
+            return std::vector<std::int64_t>{};
+          },
+          [&](const MeshBuffer &buffer) {
+            LOG_FATAL("getTensorStride from MeshBuffer not supported.");
+            return std::vector<std::int64_t>{};
+          },
+      },
+      tensor.as<MetalTensor>(DeviceRuntime::TTMetal));
+}
+
+std::uint32_t getTensorElementSize(Tensor tensor) {
+  return std::visit(
+      utils::overloaded{
+          [&](const std::uint32_t &) {
+            LOG_FATAL("Unsupported variant type");
+            return static_cast<std::uint32_t>(0);
+          },
+          [&](const TensorDesc &desc) {
+            return static_cast<std::uint32_t>(
+                ttmetal::getTensorDesc(tensor).elementSize());
+          },
+          [&](const HostBuffer &buffer) {
+            auto span = buffer->view_bytes();
+            using ElementType = decltype(span)::element_type;
+            return static_cast<std::uint32_t>(sizeof(ElementType));
+          },
+          [&](const DistributedHostBuffer &buffer) {
+            LOG_FATAL("getTensorElementSize from DistributedHostBuffer not "
+                      "supported.");
+            return static_cast<std::uint32_t>(0);
+          },
+          [&](const MeshBuffer &buffer) {
+            LOG_FATAL("getTensorElementSize from MeshBuffer not supported.");
+            return static_cast<std::uint32_t>(0);
+          },
+      },
+      tensor.as<MetalTensor>(DeviceRuntime::TTMetal));
+}
+
+std::uint32_t getTensorVolume(Tensor tensor) {
+  return std::visit(
+      utils::overloaded{
+          [&](const std::uint32_t &) {
+            LOG_FATAL("Unsupported variant type");
+            return static_cast<std::uint32_t>(0);
+          },
+          [&](const TensorDesc &desc) {
+            return static_cast<std::uint32_t>(
+                ttmetal::getTensorDesc(tensor).volume());
+          },
+          [&](const HostBuffer &buffer) {
+            return static_cast<std::uint32_t>(
+                buffer->view_bytes().size_bytes());
+          },
+          [&](const DistributedHostBuffer &buffer) {
+            LOG_FATAL(
+                "getTensorVolume from DistributedHostBuffer not supported.");
+            return static_cast<std::uint32_t>(0);
+          },
+          [&](const MeshBuffer &buffer) {
+            LOG_FATAL("getTensorVolume from MeshBuffer not supported.");
+            return static_cast<std::uint32_t>(0);
+          },
+      },
+      tensor.as<MetalTensor>(DeviceRuntime::TTMetal));
+}
+
+TensorDesc getTensorDesc(Tensor tensor) {
+  return std::visit(
+      utils::overloaded{
+          [&](const std::uint32_t &) {
+            LOG_FATAL("Unsupported variant type");
+            return TensorDesc{};
+          },
+          [&](const TensorDesc &desc) { return desc; },
+          [&](const HostBuffer &buffer) {
+            LOG_FATAL("getTensorDesc from HostBuffer not supported.");
+            return TensorDesc{};
+          },
+          [&](const DistributedHostBuffer &buffer) {
+            LOG_FATAL(
+                "getTensorDesc from DistributedHostBuffer not supported.");
+            return TensorDesc{};
+          },
+          [&](const MeshBuffer &buffer) {
+            LOG_FATAL("getTensorDesc from MeshBuffer not supported.");
+            return TensorDesc{};
+          },
+      },
+      tensor.as<MetalTensor>(DeviceRuntime::TTMetal));
+}
+
+HostBuffer getHostBuffer(Tensor tensor) {
+  return std::visit(
+      utils::overloaded{
+          [&](const std::uint32_t &) {
+            LOG_FATAL("Unsupported variant type");
+            return HostBuffer{};
+          },
+          [&](const TensorDesc &desc) {
+            LOG_FATAL("getHostBuffer from TensorDesc not supported.");
+            return HostBuffer{};
+          },
+          [&](const HostBuffer &buffer) { return buffer; },
+          [&](const DistributedHostBuffer &buffer) {
+            LOG_FATAL("getHostBuffer from DistributedHostBuffer "
+                      "not supported.");
+            return HostBuffer{};
+          },
+          [&](const MeshBuffer &buffer) {
+            LOG_FATAL("getHostBuffer from MeshBuffer not supported.");
+            return HostBuffer{};
+          },
+      },
+      tensor.as<MetalTensor>(DeviceRuntime::TTMetal));
+}
+
+DistributedHostBuffer getDistributedHostBuffer(Tensor tensor) {
+  return std::visit(
+      utils::overloaded{
+          [&](const std::uint32_t &) {
+            LOG_FATAL("Unsupported variant type");
+            return DistributedHostBuffer{};
+          },
+          [&](const TensorDesc &desc) {
+            LOG_FATAL("getDistributedHostBufferFromMetalTensor from TensorDesc "
+                      "not supported.");
+            return DistributedHostBuffer{};
+          },
+          [&](const HostBuffer &buffer) {
+            LOG_FATAL("getDistributedHostBufferFromMetalTensor from HostBuffer "
+                      "not supported.");
+            return DistributedHostBuffer{};
+          },
+          [&](const DistributedHostBuffer &buffer) { return buffer; },
+          [&](const MeshBuffer &buffer) {
+            LOG_FATAL("getDistributedHostBufferFromMetalTensor from MeshBuffer "
+                      "not supported.");
+            return DistributedHostBuffer{};
+          },
+      },
+      tensor.as<MetalTensor>(DeviceRuntime::TTMetal));
+}
+
+std::vector<Tensor> submit(Device deviceHandle, Binary executableHandle,
+                           std::uint32_t programIndex,
+                           std::vector<Tensor> &inputs) {
+  const target::metal::TTMetalBinary &fbb = *getBinary(executableHandle);
+  const target::metal::Program *program = fbb.programs()->Get(programIndex);
+  tt_metal::distributed::MeshDevice &meshDevice =
+      deviceHandle.as<tt_metal::distributed::MeshDevice>(
+          DeviceRuntime::TTMetal);
+  if (meshDevice.num_rows() != 1 || meshDevice.num_cols() != 1) {
+    LOG_WARNING("D2M runtime multi-device support is experimental. mesh = [",
+                meshDevice.num_rows(), ", ", meshDevice.num_cols(), "]");
+  }
+
+  auto openDeviceProgramMeshDevice =
+      [](std::shared_ptr<tt_metal::distributed::MeshDevice> parentMeshDevice,
+         const target::metal::MeshDesc *meshDesc)
+      -> std::shared_ptr<tt_metal::distributed::MeshDevice> {
+    if (meshDesc == nullptr) {
+      return parentMeshDevice;
+    }
+    const auto *fbMeshShape = meshDesc->mesh_shape();
+    std::vector<int64_t> subMeshShape(fbMeshShape->begin(), fbMeshShape->end());
+    LOG_ASSERT(subMeshShape.size() == 2, "MeshDesc shape must be 2D for now");
+    auto parentMeshShape = parentMeshDevice->shape();
+    if (parentMeshShape[0] == subMeshShape[0] &&
+        parentMeshShape[1] == subMeshShape[1]) {
+      return parentMeshDevice;
+    }
+
+    LOG_INFO("Create submesh for a deviceProgram with shape [", subMeshShape[0],
+             ", ", subMeshShape[1], "]");
+    return parentMeshDevice->create_submesh(
+        tt_metal::distributed::MeshShape(subMeshShape[0], subMeshShape[1]));
+  };
+
+  std::vector<std::shared_ptr<tt_metal::distributed::MeshDevice>>
+      deviceProgramMeshDevice(program->device_programs()->size());
+  std::vector<Tensor> outputs;
+  for (std::size_t i = 0; i < program->device_programs()->size(); ++i) {
+    const target::metal::DeviceProgram *deviceProgram =
+        program->device_programs()->Get(i);
+    deviceProgramMeshDevice[i] = openDeviceProgramMeshDevice(
+        deviceHandle.asSharedPtr<tt_metal::distributed::MeshDevice>(
+            DeviceRuntime::TTMetal),
+        deviceProgram->mesh());
+
+    ZoneScoped;
+    std::string zoneName = "submit_" + std::string(program->name()->c_str()) +
+                           "_device_" +
+                           std::to_string(deviceProgramMeshDevice[i]->id());
+    ZoneName(zoneName.c_str(), zoneName.size());
+
+    outputs = executeMeshDeviceProgram(deviceProgramMeshDevice[i].get(),
+                                       deviceProgram, inputs,
+                                       common::DylibManager(fbb.dylibs()));
+
+    LOG_ASSERT(outputs.size() == program->outputs()->size(),
+               "Outputs size mismatch");
+  }
+
+  return outputs;
+}
+
+} // namespace tt::runtime::ttmetal

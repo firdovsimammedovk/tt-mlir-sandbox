@@ -1,0 +1,394 @@
+# SPDX-FileCopyrightText: (c) 2025 Tenstorrent AI ULC
+#
+# SPDX-License-Identifier: Apache-2.0
+
+import math
+import hashlib
+from collections import namedtuple
+
+from .kernel_types import *
+
+# Import ttnn for only the op.py module
+try:
+    import ttnn
+except Exception as e:
+    ttnn = e
+
+
+OpCircularBuffer = namedtuple(
+    "OpCircularBuffer", ["cb_type", "cb_format", "cb_descriptor"]
+)
+OpKernel = namedtuple("OpKernel", ["kernel_type", "kernel_descriptor"])
+
+
+class PyKernelOp:
+    """
+    Base class for PyKernel Operations, contains a variety of methods to be overridden.
+    """
+
+    def __init__(self):
+        """Initialize the PyKernelOp with an empty kernel selection dictionary. Intakes the `ttnn` module to operate."""
+        self.kernel_selection = {}
+        self.kernel_cache = {}
+
+        # Keep a mobile statewise reference to the ttnn module
+        if isinstance(ttnn, Exception):
+            raise ttnn
+        self.ttnn = ttnn
+
+    def _tile_bytes_from_ttnn_dtype(self, dtype):
+        # Retrieved from: https://github.com/tenstorrent/tt-buda/blob/main/pybuda/csrc/balancer/balancer_utils.hpp
+        match dtype:
+            case 0 | 6:  # BFP16, U16
+                return 32 * 32 * 2
+            case 1 | 2 | 7:
+                return 32 * 32 * 4
+            case 3:
+                return 32 * 32 + 64
+            case 5:
+                return 32 * 32
+            case 4:
+                return 512 + 64
+            case _:
+                return "Invalid DataType Processed"
+
+    def _mlir_dtype_from_ttnn_dtype(self, dtype):
+        match dtype:
+            case 0:
+                return "BFloat16"
+            case 1:
+                return "Float32"
+            case 2:
+                return "UInt32"
+            case 5:
+                return "UInt8"
+            case 6:
+                return "UInt16"
+            case 7:
+                return "Int32"
+            case _:
+                return "Invalid"
+
+    def get_core_ranges(self, core_ranges=None):
+        if core_ranges is None:
+            if not hasattr(self, "defined_core_ranges"):
+                raise ValueError(
+                    "Trying to retrieve core ranges before function initialization"
+                )
+            return self.defined_core_ranges
+        return core_ranges
+
+    def define_core_ranges(self, tensors, options):
+        """Define Core Ranges from tensors and options."""
+        # Default implementation - subclasses should override
+        # Returns a 0, 0 core range:
+        core = self.ttnn.CoreCoord(0, 0)
+        return self.ttnn.CoreRangeSet([self.ttnn.CoreRange(core, core)])
+
+    def _get_tensor_accessor_config(self, tensor):
+        config = TensorAccessorConfig.NONE.value
+        memory_config = tensor.memory_config()
+        if memory_config.buffer_type == self.ttnn.BufferType.DRAM:
+            config |= TensorAccessorConfig.IsDram.value
+        if memory_config.is_sharded():
+            config |= TensorAccessorConfig.Sharded.value
+
+        return config
+
+    def _get_tensor_accessor_configs(self, tensors_or_configs):
+        if tensors_or_configs is None:
+            return []
+        if not isinstance(tensors_or_configs, (list, tuple)):
+            tensors_or_configs = [tensors_or_configs]
+
+        configs = []
+        for tensor_or_config in tensors_or_configs:
+            if isinstance(tensor_or_config, TensorAccessorConfig):
+                configs.append(tensor_or_config.value)
+            elif isinstance(tensor_or_config, int):
+                configs.append(tensor_or_config)
+            else:
+                configs.append(self._get_tensor_accessor_config(tensor_or_config))
+
+        return configs
+
+    def _compute_input_hash(self, tensors, options):
+        """Compute a hash of the input tensors and compile-time options."""
+        # Simplified implementation - should be enhanced for production
+        tensor_metadata = []
+        for tensor in tensors:
+            memory_config = (
+                tensor.memory_config() if hasattr(tensor, "memory_config") else None
+            )
+            memory_metadata = None
+            if memory_config is not None:
+                memory_metadata = (
+                    getattr(memory_config, "buffer_type", None),
+                    memory_config.is_sharded(),
+                )
+            tensor_metadata.append(
+                (
+                    getattr(tensor, "shape", None),
+                    getattr(tensor, "dtype", None),
+                    memory_metadata,
+                )
+            )
+        hash_input = str(tensor_metadata)
+        hash_input += str(options)
+        return hashlib.md5(hash_input.encode()).hexdigest()
+
+    def invoke(self, *tensors, **options):
+        # Default Implementation - Returns None and throws error
+        return None
+
+    def _config_from_thread_type(self, thread_name):
+        match thread_name:
+            case "reader_thread":
+                return self.ttnn.ReaderConfigDescriptor
+            case "writer_thread":
+                return self.ttnn.WriterConfigDescriptor
+            case "compute_thread":
+                return self.ttnn.ComputeConfigDescriptor
+            case _:
+                raise ValueError(
+                    f"Kernel must be decorated with valid thread option. Thread Name Provided: {thread_name}"
+                )
+
+    def make_ct_args(self, **ct_args):
+        return [CompileTimeValue(k, v) for k, v in ct_args.items()]
+
+    def get_buffer_addr(self, tensor):
+        return tensor.buffer_address()
+
+    def create_cb(self, tensor, buffer_index, core_ranges=None, **options):
+        # Utility function to create CB given tensor. Returns an OpCircularBuffer Object
+        dtype = tensor.dtype
+        page_size = self._tile_bytes_from_ttnn_dtype(dtype.value)
+        num_tiles = math.ceil(tensor.volume() / 1024)
+        total_size = num_tiles * page_size
+
+        # Define core_ranges
+        core_ranges = self.get_core_ranges(core_ranges)
+
+        cb_format = self.ttnn.CBFormatDescriptor(
+            buffer_index=buffer_index, data_format=dtype, page_size=page_size
+        )
+
+        cb_desc = self.ttnn.CBDescriptor(
+            total_size=total_size,
+            core_ranges=core_ranges,
+            format_descriptors=[cb_format],
+        )
+
+        cb_type = CircularBuffer(
+            buffer_index,
+            tuple(tensor.shape),
+            dtype=self._mlir_dtype_from_ttnn_dtype(dtype.value),
+        )
+
+        return OpCircularBuffer(cb_type, cb_format, cb_desc)
+
+    def create_rt_args(self, core_ranges=None):
+        # Argument_dict is a dict with keys of Core types, and values of list[int]
+
+        # Check for various instances of core types
+        # Get the core grid size from the define_core_ranges function
+        core_grid = self.get_core_ranges(core_ranges)
+        grid_size = core_grid.bounding_box().grid_size()
+
+        result = [[0 for j in range(grid_size.y)] for i in range(grid_size.x)]
+
+        return result
+
+    def _convert_rt_args_to_kernel_descriptor_runtime_args(self, rt_args, core_ranges):
+        """
+        Convert PyKernel's legacy 2D runtime-args format:
+          rt_args[x_offset][y_offset] == list[int]
+        into tt-metal's new KernelDescriptor runtime_args format:
+          Sequence[tuple[CoreCoord, Sequence[int]]]
+
+        """
+        if rt_args is None:
+            return []
+
+        if not isinstance(rt_args, list):
+            # Allow callers to pass-through already-converted runtime args objects.
+            return rt_args
+
+        if not rt_args:
+            return []
+
+        # Expect 2D list: outer is X, inner is Y. Each element is list[int].
+        if not isinstance(rt_args[0], (list, tuple)):
+            raise TypeError(
+                "Internal error: rt_args must be a 2D list (list[list[list[int]]])."
+            )
+
+        bb = core_ranges.bounding_box()
+        expected_x = bb.end.x - bb.start.x + 1
+        expected_y = bb.end.y - bb.start.y + 1
+
+        if len(rt_args) > expected_x:
+            raise ValueError(
+                f"rt_args X dimension ({len(rt_args)}) exceeds core_ranges bounding box ({expected_x})."
+            )
+        for row in rt_args:
+            if len(row) > expected_y:
+                raise ValueError(
+                    f"rt_args Y dimension ({len(row)}) exceeds core_ranges bounding box ({expected_y})."
+                )
+
+        runtime_args_pairs = []
+        for x_offset, row in enumerate(rt_args):
+            for y_offset, vals in enumerate(row):
+                if vals is None:
+                    continue
+                if not isinstance(vals, (list, tuple)):
+                    raise TypeError(
+                        "Internal error: rt_args entries must be list[int]."
+                    )
+                if len(vals) == 0:
+                    continue
+                x = bb.start.x + x_offset
+                y = bb.start.y + y_offset
+                runtime_args_pairs.append((self.ttnn.CoreCoord(x, y), list(vals)))
+
+        return runtime_args_pairs
+
+    # Use common runtime args for scalars, otherwise use arg_val for list of lists and template function to resolve this.
+    # Who knew function signature theory and resolution order would be relevant one day
+    def create_kernel(
+        self, kernel, *args, core_ranges=None, tensor_accessor_configs=None, **kwargs
+    ):
+        # Resolve core_ranges
+        core_ranges = self.get_core_ranges(core_ranges)
+
+        # Resolve arguments from list of list structure
+        # Check for all arguments
+
+        cb_args = []
+        common_rt_args = []
+        arg_idx = 0
+        common_idx = 0
+        rt_args = None
+        all_rt_args = []
+
+        for arg in args:
+            if isinstance(arg, OpCircularBuffer):
+                cb_args.append(arg)
+            elif isinstance(arg, int):
+                # Scalar Integer, treat as a CommonRuntimeArg
+                _arg = Arguments.make_common(arg, common_idx)
+                common_rt_args.append(arg)
+                all_rt_args.append(_arg)
+                common_idx += 1
+                arg_idx += 1
+            elif isinstance(arg, list):
+                # Make sure it's a list of lists
+                if not arg:
+                    raise IndexError("Empty list provided as positional argument.")
+                if not isinstance(arg[0], (list, tuple)):
+                    raise TypeError(
+                        "Core-Specific RT Args must be formatted as a list of lists spanning the core_range"
+                    )
+                if not all(
+                    all(all(isinstance(x, int) for x in _args) for _args in row)
+                    for row in arg
+                ):
+                    raise TypeError(
+                        "Core-Specific RT Args must all be integer values across the 2D Core Grid."
+                    )
+
+                # just a placeholder so that the IR parses the RT arg as an int type (uses get_arg_val)
+                all_rt_args.append(0)
+
+                # Construct the mega rt_args
+                if rt_args is None:
+                    # initialize to size of list provided
+                    rt_args = arg
+                else:
+                    # List already initialized, append to each element
+                    for i, row in enumerate(rt_args):
+                        for j, _list in enumerate(row):
+                            _list.extend(arg[i][j])
+
+                arg_idx += 1
+
+        accessor_config_args = self._get_tensor_accessor_configs(
+            tensor_accessor_configs
+        )
+        ct_const_args = self.make_ct_args(**kwargs)
+
+        if rt_args is None:
+            rt_args = [[[]]]
+
+        runtime_args = self._convert_rt_args_to_kernel_descriptor_runtime_args(
+            rt_args, core_ranges
+        )
+
+        # Get the PyKernel type for cb_args
+        cb_args = [x.cb_type for x in args if isinstance(x, OpCircularBuffer)]
+
+        kernel_string = kernel(*cb_args, *all_rt_args, *ct_const_args)
+        kernel_t = Kernel(kernel.__name__, kernel_string)
+        kernel_path = kernel_t.dump_to_file()
+
+        config = self._config_from_thread_type(kernel._decorator_name)
+        compile_time_args = [cb.cb_id for cb in cb_args] + accessor_config_args
+
+        kernel_desc_args = {
+            "kernel_source": kernel_path,
+            "core_ranges": self.get_core_ranges(core_ranges),
+            "compile_time_args": compile_time_args,
+            "runtime_args": runtime_args,
+            "config": config(),
+        }
+
+        if common_rt_args:
+            kernel_desc_args["common_runtime_args"] = common_rt_args
+
+        kernel_desc = self.ttnn.KernelDescriptor(**kernel_desc_args)
+
+        return OpKernel(kernel_t, kernel_desc)
+
+    def create_program(self, kernels, cbs, semaphores=[]):
+        return self.ttnn.ProgramDescriptor(
+            kernels=[kernel.kernel_descriptor for kernel in kernels],
+            cbs=[cb.cb_descriptor for cb in cbs],
+            semaphores=semaphores,
+        )
+
+    def __call__(self, *tensors, **options):
+        """
+        Execute the kernel operation on the given tensors with specified options.
+
+        Args:
+            tensors: Input tensors
+            options: Additional options for kernel execution
+
+        Returns:
+            Result tensor(s) from the operation
+        """
+
+        # Invoked at "runtime", set the defined_core_ranges from the define_core_ranges function
+        self.defined_core_ranges = self.define_core_ranges(tensors, options)
+
+        # Compute hash for kernel selection and caching
+        input_hash = self._compute_input_hash(tensors, options)
+
+        # Check if kernel is already cached
+        if input_hash not in self.kernel_cache:
+            program_descriptor = self.invoke(*tensors, **options)
+            if program_descriptor is None:
+                raise Exception("invoke method must be defined for PyKernelOp.")
+
+            # Store the compiled kernel in the cache
+            self.kernel_cache[input_hash] = {
+                "program_descriptor": program_descriptor,
+            }
+
+        # Retrieve cached kernel information and execute
+        cached_info = self.kernel_cache[input_hash]
+        program = cached_info["program_descriptor"]
+
+        return self.ttnn.generic_op(tensors, program)

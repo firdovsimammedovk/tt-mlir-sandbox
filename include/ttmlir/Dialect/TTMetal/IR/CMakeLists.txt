@@ -1,0 +1,22 @@
+add_mlir_dialect(TTMetalOps ttmetal)
+add_mlir_doc(TTMetalBase TTMetalDialect src/autogen/md/Dialect/ -gen-dialect-doc)
+add_mlir_doc(TTMetalOps TTMetalOp src/autogen/md/Dialect/ -gen-op-doc)
+add_mlir_doc(TTMetalOpsAttrs TTMetalAttrs src/autogen/md/Dialect/ -gen-attrdef-doc)
+
+set(LLVM_TARGET_DEFINITIONS TTMetalAttrInterfaces.td)
+mlir_tablegen(TTMetalAttrInterfaces.h.inc -gen-attr-interface-decls)
+mlir_tablegen(TTMetalAttrInterfaces.cpp.inc -gen-attr-interface-defs)
+add_public_tablegen_target(TTMetalAttrInterfacesIncGen)
+add_dependencies(mlir-headers TTMetalAttrInterfacesIncGen)
+
+set(LLVM_TARGET_DEFINITIONS TTMetalOpsAttrs.td)
+mlir_tablegen(TTMetalOpsAttrDefs.h.inc -gen-attrdef-decls)
+mlir_tablegen(TTMetalOpsAttrDefs.cpp.inc -gen-attrdef-defs)
+add_public_tablegen_target(MLIRTTMetalOpsAttributesIncGen)
+add_dependencies(mlir-headers MLIRTTMetalOpsAttributesIncGen)
+
+set(LLVM_TARGET_DEFINITIONS TTMetalOpsEnums.td)
+mlir_tablegen(TTMetalOpsEnums.h.inc -gen-enum-decls)
+mlir_tablegen(TTMetalOpsEnums.cpp.inc -gen-enum-defs)
+add_public_tablegen_target(MLIRTTMetalOpsEnumsIncGen)
+add_dependencies(mlir-headers MLIRTTMetalOpsEnumsIncGen)

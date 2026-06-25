@@ -1,0 +1,691 @@
+# SPDX-FileCopyrightText: (c) 2025 Tenstorrent AI ULC
+#
+# SPDX-License-Identifier: Apache-2.0
+
+from __future__ import annotations
+import inspect
+import functools
+from dataclasses import dataclass
+from typing import List, Optional, Union, Tuple, Callable, Dict, Any, Sequence, get_args
+import torch
+from enum import Enum, auto
+import re
+from collections import OrderedDict
+
+from ttmlir.ir import *
+from ttmlir.dialects import d2m, ttcore, tensor, quant
+from ttmlir.passes import GoldenTensor, DataType
+
+from builder.base.builder import *
+from builder.base.builder_enums import MeshShardDirection, MeshShardType
+from builder.base.builder_utils import *
+
+from golden import *
+
+
+class D2MBuilder(Builder):
+
+    # ----- Methods -----
+
+    def __init__(
+        self,
+        ctx: Context,
+        location: Location,
+        mesh_name: Union[List[str], str] = "mesh",
+        mesh_dict: Union[
+            List[OrderedDict[str, int]], OrderedDict[str, int]
+        ] = OrderedDict([("x", 1), ("y", 1)]),
+        system_desc_path: Optional[str] = None,
+    ):
+        super().__init__(
+            ctx, location, mesh_name, mesh_dict, system_desc_path=system_desc_path
+        )
+        self.goldens_set = False
+
+    def set_goldens(self, *args, **kwargs):
+        super().set_goldens(*args, **kwargs)
+        self.goldens_set = True
+
+    def _get_golden_tensor(self, *args, **kwargs):
+        if not self.goldens_set:
+            raise RuntimeError(
+                "You must manually use builder.set_goldens(...) API for D2MBuilder"
+            )
+        return super()._get_golden_tensor(*args, **kwargs)
+
+    # ----- Private methods -----
+
+    def _op_proxy(
+        self,
+        op_d2m_function: Callable,
+        inputs: List[Operand],
+        unit_attrs: Optional[List[str]] = None,
+        organize_d2m_args: Optional[Callable] = None,
+        output_shape: Optional[Shape] = None,
+        output_type: Optional[Type] = None,
+        output_create_fn: Optional[Callable] = None,
+        d2m_kwargs: dict = {},
+        loc: Optional[Union[str, Location]] = None,
+    ) -> Any:
+        """
+        Proxy method for creating D2M operations with golden tensor support.
+        Similar to TTIRBuilder._op_proxy but for D2M operations.
+        """
+
+        if organize_d2m_args is None:
+            organize_d2m_args = self._organize_eltwise_d2m
+
+        if output_create_fn is None:
+            output_create_fn = self._create_empty_from_tensor_type
+
+        if output_type is None:
+            output_type = self._get_type(inputs[0])
+
+        if output_shape is None:
+            output_shape = self._get_type(inputs[0]).shape
+
+        with self._ctx, self._loc:
+            output = output_create_fn(output_shape, output_type)
+
+            if loc is not None:
+                loc = Location.name(loc, context=self._ctx)
+
+            op = op_d2m_function(
+                *organize_d2m_args(inputs, output, output_shape),
+                loc=loc,
+                **d2m_kwargs,
+            )
+
+            # Set unit attributes if provided.
+            if unit_attrs is not None:
+                for attr_name in unit_attrs:
+                    op.operation.attributes[attr_name] = UnitAttr.get(self._ctx)
+
+            return op.result
+
+    def _resolve_output_spec(
+        self, output: Optional[Operand], output_type: Optional[Type]
+    ) -> Tuple[Type, Callable]:
+        if output_type is None and output is not None and isinstance(output, Type):
+            output_type = output
+            output = None
+
+        if (output is None) == (output_type is None):
+            raise ValueError("requires exactly one of `output` or `output_type`.")
+
+        if output is not None:
+            resolved_output = output
+            resolved_output_type = self._get_type(output)
+            output_create_fn = lambda _shape, _type: resolved_output
+            return resolved_output_type, output_create_fn
+
+        return output_type, self._create_empty_from_tensor_type
+
+    def create_tensor_encoding(
+        self, shape: Shape, element_type: Union[torch.dtype, TypeInfo]
+    ) -> ttnn.ir.TTNNLayoutAttr:
+        return None
+
+    # ----- Public methods -----
+
+    # ----- D2M Operation Creation Methods -----
+
+    def _get_empty_op(self, tensor_type: RankedTensorType) -> OpView:
+        """Get D2M-specific empty operation."""
+        return d2m.EmptyOp(tensor_type).result
+
+    def empty(
+        self,
+        output_type: RankedTensorType,
+        virtual_grid_inverse_mapping: Optional[Union[AffineMap, AffineMapAttr]] = None,
+        virtual_grid_forward_mapping: Optional[Union[AffineMap, AffineMapAttr]] = None,
+    ) -> OpView:
+        """Create a D2M empty op with optional virtual-grid mappings."""
+        vgm_inv_attr = (
+            virtual_grid_inverse_mapping
+            if isinstance(virtual_grid_inverse_mapping, AffineMapAttr)
+            else (
+                AffineMapAttr.get(virtual_grid_inverse_mapping)
+                if virtual_grid_inverse_mapping is not None
+                else None
+            )
+        )
+        vgm_fwd_attr = (
+            virtual_grid_forward_mapping
+            if isinstance(virtual_grid_forward_mapping, AffineMapAttr)
+            else (
+                AffineMapAttr.get(virtual_grid_forward_mapping)
+                if virtual_grid_forward_mapping is not None
+                else None
+            )
+        )
+
+        with self._ctx, self._loc:
+            return d2m.EmptyOp(
+                output_type,
+                virtualGridInverseMapping=vgm_inv_attr,
+                virtualGridForwardMapping=vgm_fwd_attr,
+            ).result
+
+    # ----- D2M Layout Operations -----
+
+    def mesh_shard(
+        self,
+        input: Operand,
+        shard_type: MeshShardType,
+        shard_direction: MeshShardDirection,
+        shard_shape: List[int],
+        shard_dims: List[int],
+        loc: Optional[Union[str, Location]] = None,
+    ) -> OpView:
+        input_type = self._get_type(input)
+        rank = len(input_type.shape)
+
+        output_shape = list(input_type.shape)
+        if shard_type == MeshShardType.Replicate:
+            if shard_dims != [-1]:
+                raise ValueError(f"replicate shard_dims must be [-1], got {shard_dims}")
+        else:
+            if len(shard_shape) != len(shard_dims):
+                raise ValueError(
+                    f"shard_shape/shard_dims length mismatch: "
+                    f"{len(shard_shape)} != {len(shard_dims)}"
+                )
+            for factor, dim in zip(shard_shape, shard_dims):
+                if factor <= 0:
+                    raise ValueError(f"invalid shard factor: {factor}")
+                if dim < 0:
+                    continue
+                if dim >= rank:
+                    raise ValueError(f"shard dim out of range: dim={dim}, rank={rank}")
+                if shard_direction == MeshShardDirection.FullToShard:
+                    if output_shape[dim] % factor != 0:
+                        raise ValueError(
+                            f"non-divisible shard: dim_size={output_shape[dim]}, "
+                            f"factor={factor}, dim={dim}"
+                        )
+                    output_shape[dim] //= factor
+                else:
+                    output_shape[dim] *= factor
+
+        output_encoding = None
+        if shard_direction == MeshShardDirection.FullToShard:
+            mesh_attr = Attribute.parse(
+                f'#ttcore.tensor_mesh<"{self._mesh_name}">', self._ctx
+            )
+            output_encoding = mesh_attr
+
+        output_type = RankedTensorType.get(
+            output_shape, input_type.element_type, output_encoding
+        )
+
+        shard_type_attr = ttcore.ir.MeshShardTypeAttr.get(self._ctx, shard_type.value)
+        shard_direction_attr = ttcore.ir.MeshShardDirectionAttr.get(
+            self._ctx, shard_direction.value
+        )
+        shard_shape_attr = DenseI64ArrayAttr.get(shard_shape)
+        shard_dims_attr = DenseI64ArrayAttr.get(shard_dims)
+
+        with self._ctx, self._loc:
+            if loc is not None:
+                loc = Location.name(loc, context=self._ctx)
+            op = d2m.MeshShardOp(
+                output_type,
+                input,
+                shard_type_attr,
+                shard_direction_attr,
+                shard_shape_attr,
+                shard_dims_attr,
+                loc=loc,
+            )
+            return op.result
+
+    def to_layout(
+        self,
+        input: Operand,
+        output: Optional[Operand] = None,
+        output_type: Optional[Type] = None,
+        unit_attrs: Optional[List[str]] = None,
+        loc: Optional[Union[str, Location]] = None,
+    ) -> OpView:
+        """
+        Create a D2M to_layout operation.
+
+        Args:
+            input: Input operand
+            output: Optional destination operand to use directly.
+            output_type: Optional destination type. Must provide exactly one of
+                `output` or `output_type`.
+            unit_attrs: Optional unit attributes
+            loc: Optional location string
+
+        Returns:
+            OpView of the D2M to_layout operation
+        """
+        resolved_output_type, output_create_fn = self._resolve_output_spec(
+            output=output, output_type=output_type
+        )
+
+        def organize_to_layout_args(inputs, output, output_shape):
+            # D2M ToLayoutOp expects: (results_, input, output)
+            return ([resolved_output_type], inputs[0], output)
+
+        return self._op_proxy(
+            d2m.ToLayoutOp,
+            [input],
+            unit_attrs=unit_attrs,
+            organize_d2m_args=organize_to_layout_args,
+            output_type=resolved_output_type,
+            output_shape=resolved_output_type.shape,
+            output_create_fn=output_create_fn,
+            loc=loc,
+        )
+
+    def view_layout(
+        self,
+        input: Operand,
+        output_type: Type,
+        remapping: Optional[Union[AffineMap, AffineMapAttr]] = None,
+        reinterpret_layout: bool = False,
+        unit_attrs: Optional[List[str]] = None,
+    ) -> OpView:
+        """Create a D2M view_layout operation."""
+
+        if remapping is None:
+            remapping = AffineMap.get_identity(len(output_type.shape), self._ctx)
+        remapping_attr = (
+            remapping
+            if isinstance(remapping, AffineMapAttr)
+            else AffineMapAttr.get(remapping)
+        )
+
+        result = self._op_proxy(
+            d2m.ViewLayoutOp,
+            [input],
+            d2m_kwargs={
+                "remapping": remapping_attr,
+                "reinterpretLayout": reinterpret_layout,
+            },
+            output_type=output_type,
+            output_shape=output_type.shape,
+            output_create_fn=self._create_empty_from_tensor_type,
+            organize_d2m_args=lambda i, o, _: (self._get_type(o), i[0]),
+            unit_attrs=unit_attrs,
+        )
+
+        return result
+
+    # ----- D2M Layout Convenience Methods -----
+
+    def tilize(
+        self,
+        input: Operand,
+        output: Optional[Operand] = None,
+        output_type: Optional[Type] = None,
+        unit_attrs: Optional[List[str]] = None,
+    ) -> OpView:
+        """
+        Create a D2M tilize operation (specialized to_layout with tiled output).
+
+        This is a convenience method that creates a to_layout operation
+        with a tiled layout output type.
+        """
+        return self.to_layout(
+            input,
+            output=output,
+            output_type=output_type,
+            unit_attrs=unit_attrs,
+        )
+
+    def untilize(
+        self,
+        input: Operand,
+        output: Optional[Operand] = None,
+        output_type: Optional[Type] = None,
+        unit_attrs: Optional[List[str]] = None,
+    ) -> OpView:
+        """
+        Create a D2M untilize operation (specialized to_layout with row-major output).
+
+        This is a convenience method that creates a to_layout operation
+        with a row-major (untiled) layout output type.
+        """
+        return self.to_layout(
+            input,
+            output=output,
+            output_type=output_type,
+            unit_attrs=unit_attrs,
+        )
+
+    def mask(
+        self,
+        input: Operand,
+        logical_shape: Shape,
+        fill_value: Union[ttcore.OOBVal, ttcore.ir.OOBValAttr],
+        output: Optional[Operand] = None,
+        output_type: Optional[Type] = None,
+        unit_attrs: Optional[List[str]] = None,
+    ) -> OpView:
+        """Create a D2M mask operation over padded regions."""
+        if output is None and output_type is None:
+            output_type = self._get_type(input)
+
+        resolved_output_type, output_create_fn = self._resolve_output_spec(
+            output=output, output_type=output_type
+        )
+        fill_value_attr = (
+            fill_value
+            if isinstance(fill_value, Attribute)
+            else ttcore.ir.OOBValAttr.get(self._ctx, int(fill_value))
+        )
+
+        def organize_mask_args(inputs, output, output_shape):
+            return (
+                resolved_output_type,
+                inputs[0],
+                output,
+                list(logical_shape),
+                fill_value_attr,
+            )
+
+        return self._op_proxy(
+            d2m.MaskOp,
+            [input],
+            unit_attrs=unit_attrs,
+            organize_d2m_args=organize_mask_args,
+            output_type=resolved_output_type,
+            output_shape=resolved_output_type.shape,
+            output_create_fn=output_create_fn,
+        )
+
+    def reblock(
+        self,
+        input: Operand,
+        new_grid: List[int],
+        unit_attrs: Optional[List[str]] = None,
+    ) -> OpView:
+        assert (
+            len(input.type.shape) % 2 == 0
+        ), f"Input shape must be multiple of 2 {input.type.shape}"
+        grid_rank = len(input.type.shape) // 2
+        old_grid = list(input.type.shape)[:grid_rank]
+        old_shard = list(input.type.shape)[grid_rank:]
+        assert (
+            len(new_grid) == grid_rank
+        ), f"Mismatched input/output grid rank for in {new_grid} and out {old_grid}"
+        canonical_shape = [gd * sd for gd, sd in zip(old_grid, old_shard)]
+        output_shape = list(new_grid)
+        for i, d in enumerate(canonical_shape):
+            assert (
+                d % new_grid[i] == 0
+            ), f"Illegal dims for new grid that don't divide canonical shape at dim[{i}] {d} % {new_grid[i]} != 0"
+            output_shape.append(d // new_grid[i])
+        layout = input.type.encoding
+        output_type = RankedTensorType.get(
+            output_shape, input.type.element_type, layout
+        )
+        remapping = d2m.ir.calculate_reblock_map(
+            input.type.shape, output_shape, output_type.context
+        )
+        return self.view_layout(
+            input,
+            output_type,
+            remapping,
+            unit_attrs=unit_attrs,
+        )
+
+    # ----- D2M Generic + Region ops -----
+
+    def _create_generic(
+        self,
+        operands,
+        additional_args,
+        grid,
+        block_factors,
+        indexing_maps,
+        iterator_types,
+        fabric_connection_config=None,
+    ):
+        if (
+            isinstance(block_factors, list)
+            and len(block_factors) > 0
+            and isinstance(block_factors[0], tuple)
+        ):
+            assert isinstance(block_factors, list)
+            assert isinstance(block_factors[0], tuple)
+            block_factors = [b for bs in block_factors for b in bs]
+
+        assert not isinstance(
+            additional_args, (str, bytes)
+        ), "additional_args must be a sequence of MLIR values or None"
+        assert isinstance(
+            additional_args, Sequence
+        ), "additional_args must be a sequence of MLIR values or None"
+        additional_args = list(additional_args)
+        operand_types = get_args(Operand)
+        assert all(
+            isinstance(arg, operand_types) for arg in additional_args
+        ), "additional_args elements must be MLIR operands"
+
+        inputs = operands[:-1]
+        outputs = operands[-1:]
+        assert len(outputs) == 1
+        ret_type = outputs[0].type
+        ctx = ret_type.context
+        threads = ArrayAttr.get([d2m.ir.ThreadAttr.get(ctx, "unified")])
+        return d2m.GenericOp(
+            [ret_type],
+            inputs,
+            outputs,
+            additional_args,
+            ttcore.ir.GridAttr.get(ctx, grid),
+            block_factors,
+            list(map(affine_map_from_lambda, indexing_maps)),
+            ArrayAttr.get(
+                list(
+                    ttcore.ir.IteratorTypeAttr.get(
+                        ctx, ttcore.IteratorType[i.title()].value
+                    )
+                    for i in iterator_types
+                )
+            ),
+            threads,
+            len(threads),
+            fabricConnectionConfig=fabric_connection_config,
+        )
+
+    def generic(
+        self,
+        grid=None,
+        block_factors=None,
+        indexing_maps=None,
+        iterator_types=None,
+        skip_grid_selection=False,
+        fabric_connection_config=None,
+    ):
+        assert (
+            not skip_grid_selection or grid is not None
+        ), "grid must be specified if skip_grid_selection is set"
+        implicit_blocked_form = block_factors is not None
+        if implicit_blocked_form:
+            assert (
+                indexing_maps is not None
+            ), "indexing_maps must be set for generic in implicit blocked form"
+            assert (
+                iterator_types is not None
+            ), "iterator_types must be set for generic in implicit blocked form"
+            for indexing_map in indexing_maps:
+                num_dims = len(inspect.signature(indexing_map).parameters)
+                if iterator_types is not None:
+                    assert num_dims == len(iterator_types)
+                assert len(block_factors) == num_dims
+                num_results = len(indexing_map(*tuple(range(num_dims))))
+                if grid is None:
+                    grid = [1] * num_results
+                assert num_results == len(grid)
+        else:
+            assert (
+                indexing_maps is None
+            ), "indexing_maps must not be set for generic in explicit blocked form"
+            assert (
+                iterator_types is None
+            ), "iterator_types must not be set for generic in explicit blocked form"
+            assert (
+                grid is not None
+            ), "grid must be set for generic in explicit blocked form"
+            indexing_maps = []
+            iterator_types = []
+
+        def _decorator(f):
+            @functools.wraps(f)
+            def _wrapper(*args, **kwargs):
+                nonlocal self
+                nonlocal grid
+                nonlocal block_factors
+                nonlocal indexing_maps
+                nonlocal iterator_types
+                nonlocal skip_grid_selection
+                nonlocal fabric_connection_config
+
+                additional_args = kwargs.pop("additional_args", [])
+                if additional_args is None:
+                    additional_args = []
+                generic = self._create_generic(
+                    args,
+                    additional_args,
+                    grid,
+                    block_factors,
+                    indexing_maps,
+                    iterator_types,
+                    fabric_connection_config,
+                )
+                assert len(generic.regions[0].blocks) == 0
+                generic.regions[0].blocks.append()
+                block = generic.regions[0].blocks[0]
+                ctx = generic.context
+                loc = generic.location
+                if skip_grid_selection:
+                    generic.attributes["d2m.skip_grid_selection"] = UnitAttr.get(ctx)
+                with InsertionPoint(block):
+                    f(*args, *additional_args, **kwargs)
+
+                return generic.result
+
+            return _wrapper
+
+        return _decorator
+
+    def spatial(
+        self,
+        inputs: Sequence[Value],
+        outputs: Sequence[Value],
+        grid_ranges: Sequence[Tuple[Tuple[int, int], Tuple[int, int]]],
+        region_builders: Sequence[Callable[[], None]],
+        result_types: Optional[Sequence[Type]] = None,
+        unit_attrs: Optional[List[str]] = None,
+        loc: Optional[Union[str, Location]] = None,
+    ) -> OpResultList:
+        """
+        Create a d2m.spatial op with one region per grid_ranges entry.
+
+        Each callable in region_builders runs with InsertionPoint at that
+        region's entry block. Each region must contain exactly one d2m.generic
+        (see SpatialOp::verify). d2m.spatial has NoTerminator. If a region needs
+        an explicit terminator, use d2m.spatial_yield / d2m.SpatialYieldOp like
+        d2m.yield_ inside d2m.generic.
+
+        Args:
+            inputs: Variadic ins operands.
+            outputs: Variadic outs (DPS inits).
+            grid_ranges: One ((y, x), (y, x)) pair per region: inclusive start
+                and inclusive end, same as ttcore.core_range<start, end> today.
+            region_builders: One no-argument callable per core range / region.
+            result_types: Result tensor types.
+            unit_attrs: Optional unit attributes on the spatial op.
+            loc: Optional location string.
+
+        Returns:
+            op.results (one OpResult per result type).
+        """
+        num_regions = len(region_builders)
+        assert num_regions == len(
+            grid_ranges
+        ), "len(region_builders) must match len(grid_ranges)"
+
+        with self._ctx, self._loc:
+            range_attrs: List[Attribute] = []
+            for (sy, sx), (ey, ex) in grid_ranges:
+                text = f"#ttcore.core_range<({sy}, {sx}), ({ey}, {ex})>"
+                range_attrs.append(Attribute.parse(text, self._ctx))
+            grid_attr = ArrayAttr.get(range_attrs)
+            if isinstance(loc, str):
+                loc = Location.name(loc, context=self._ctx)
+            resolved_result_types = (
+                list(result_types)
+                if result_types is not None
+                else [output.type for output in outputs]
+            )
+            spatial_op = d2m.SpatialOp(
+                resolved_result_types,
+                list(inputs),
+                list(outputs),
+                grid_attr,
+                num_regions,
+                loc=loc,
+            )
+            if unit_attrs is not None:
+                for attr_name in unit_attrs:
+                    spatial_op.operation.attributes[attr_name] = UnitAttr.get(self._ctx)
+
+            for region_idx, build_region in enumerate(region_builders):
+                region = spatial_op.regions[region_idx]
+                assert len(region.blocks) == 0
+                region.blocks.append()
+                block = region.blocks[0]
+                with InsertionPoint(block):
+                    build_region()
+
+            return spatial_op.results
+
+    def remote_load(
+        self, src, indices, mcast_start_index=None, mcast_shape=None, mcast_dims=None
+    ):
+        dst = tensor.empty(src.type.shape[len(indices) :], src.type.element_type)
+        return d2m.remote_load(
+            RankedTensorType.get(dst.type.shape, dst.type.element_type),
+            src,
+            indices,
+            mcast_start_index=mcast_start_index,
+            mcast_shape=mcast_shape,
+            mcast_dims=mcast_dims,
+            local_buffer=dst,
+        )
+
+    def create_global_semaphore(
+        self,
+        output: Optional[Operand] = None,
+        output_type: Optional[RankedTensorType] = None,
+        value: Optional[int] = None,
+        unit_attrs: Optional[List[str]] = None,
+        loc: Optional[Union[str, Location]] = None,
+    ) -> OpView:
+        """Create a D2M create_global_semaphore operation."""
+        resolved_output_type, output_create_fn = self._resolve_output_spec(
+            output=output, output_type=output_type
+        )
+        d2m_kwargs = {
+            "results": [d2m.ir.GlobalSemaphoreType.get(self._ctx)],
+        }
+        if value is not None:
+            d2m_kwargs["value"] = value
+        return self._op_proxy(
+            d2m.CreateGlobalSemaphoreOp,
+            [],
+            unit_attrs=unit_attrs,
+            organize_d2m_args=lambda _inputs, output, _output_shape: (output,),
+            output_type=resolved_output_type,
+            output_shape=resolved_output_type.shape,
+            output_create_fn=output_create_fn,
+            d2m_kwargs=d2m_kwargs,
+            loc=loc,
+        )

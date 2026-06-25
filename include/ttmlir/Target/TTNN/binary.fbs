@@ -1,0 +1,19 @@
+include "ttmlir/Target/Common/types.fbs";
+include "ttmlir/Target/Common/version.fbs";
+include "ttmlir/Target/TTNN/program.fbs";
+include "ttmlir/Target/TTNN/types.fbs";
+
+namespace tt.target.ttnn;
+
+table TTNNBinary {
+  version: tt.target.Version;
+  schema_hash: string;
+  ttmlir_git_hash: string;
+  system_desc: tt.target.SystemDesc;
+  mlir: MLIR;
+  programs: [Program];
+}
+
+root_type TTNNBinary;
+file_identifier "TTNN";
+file_extension "ttnn";

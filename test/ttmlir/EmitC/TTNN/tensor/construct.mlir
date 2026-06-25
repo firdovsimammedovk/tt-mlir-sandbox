@@ -1,0 +1,21 @@
+// RUN: ttmlir-opt --ttcore-register-device="system-desc-path=%system_desc_path%" --ttcore-mark-functions-as-forward --convert-ttir-to-ttnn --ttcore-wrap-device-module -o %t.mlir %s
+//
+// RUN: ttmlir-opt --ttnn-common-to-runtime-pipeline -o %t_rt.mlir %t.mlir
+// RUN: ttmlir-translate --ttnn-to-flatbuffer -o %basename_t.ttnn %t_rt.mlir
+//
+// RUN: ttmlir-opt --ttnn-common-to-emitc-pipeline -o %t2.mlir %t.mlir
+// RUN: ttmlir-translate --mlir-to-cpp -o %basename_t.cpp %t2.mlir
+
+// UNSUPPORTED: true
+// Marked as UNSUPPORTED because it causes segfault on subsequent test.
+// https://github.com/tenstorrent/tt-mlir/issues/3511
+
+#system_memory = #ttnn.buffer_type<system_memory>
+#ttnn_layout = #ttnn.ttnn_layout<(d0, d1) -> (d0, d1), <1x1>, memref<32x32xf32, #system_memory>>
+
+module {
+  func.func @empty_host() -> tensor<32x32xf32, #ttnn_layout> {
+    %0 = ttir.empty() : tensor<32x32xf32, #ttnn_layout>
+    return %0 : tensor<32x32xf32, #ttnn_layout>
+  }
+}

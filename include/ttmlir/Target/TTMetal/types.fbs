@@ -1,0 +1,103 @@
+include "ttmlir/Target/Common/types.fbs";
+
+namespace tt.target.metal;
+
+table ShardSpec {
+  core_range_set: [Dim2dRange];
+  shard_shape: Dim2d;
+}
+
+table ShardSpecBuffer {
+  shard_spec: ShardSpec;
+  page_shape: Dim2d;
+  tensor_shape_in_pages: Dim2d;
+}
+
+// Page-domain distribution metadata used by TT-Metal host/device transfers.
+table BufferDistributionSpec {
+  tensor_shape_in_pages: [uint32];
+  shard_shape_in_pages: [uint32];
+  cores: [Dim2d];
+}
+
+table InterleavedBufferConfig {
+  size: uint64;
+  page_size: uint64;
+}
+
+table ShardedBufferConfig {
+  size: uint64;
+  page_size: uint64;
+  shard_spec_buffer: ShardSpecBuffer;
+  buffer_distribution_spec: BufferDistributionSpec;
+}
+
+union BufferConfig {
+  ShardedBufferConfig,
+  InterleavedBufferConfig
+}
+
+table CircularBufferConfig {
+  core_range_set: [Dim2dRange];
+  total_size: uint64;
+  page_size: uint64;
+  num_buffers: uint64;
+}
+
+table SystemBuffer {
+  stride: [int];
+}
+
+table MetalBuffer {
+  buffer_type: BufferType;
+  buffer_config: BufferConfig;
+  circular_buffer_config: CircularBufferConfig;
+}
+
+union BufferDetail {
+  SystemBuffer,
+  MetalBuffer
+}
+
+table BufferDesc {
+  shape: [int];
+  host_strides: [int];
+  host_volume: uint64;
+  data_type: DataType;
+  element_shape: Dim2d;
+  buffer_detail: BufferDetail;
+  mesh: string;
+}
+
+table BufferRef {
+  global_id: uint32;
+  address: uint64;
+  desc: BufferDesc;
+}
+
+table GlobalSemaphoreRef {
+  global_id: uint32;
+  address: uint64;
+}
+
+table LocalSemaphoreRef {
+  global_id: uint32;
+  initial_value: uint32;
+}
+
+union ArgRef {
+  BufferRef,
+  GlobalSemaphoreRef,
+  LocalSemaphoreRef,
+}
+
+table CBRef {
+  port: uint32;
+  buffer_ref: BufferRef;
+}
+
+table MeshDesc {
+  name: string;
+  mesh_shape: [int64];
+  mesh_offset: [int64];
+}

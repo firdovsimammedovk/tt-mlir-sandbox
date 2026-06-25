@@ -1,0 +1,620 @@
+// SPDX-FileCopyrightText: (c) 2025 Tenstorrent AI ULC
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#ifndef TTMLIR_TTMLIR_DIALECT_D2M_D2MOPS_TD
+#define TTMLIR_TTMLIR_DIALECT_D2M_D2MOPS_TD
+
+include "ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.td"
+include "ttmlir/Dialect/D2M/IR/D2MBase.td"
+include "ttmlir/Dialect/D2M/IR/D2MOpsTypes.td"
+include "ttmlir/Dialect/D2M/IR/D2MOpsAttrs.td"
+include "ttmlir/Dialect/D2M/IR/D2MOpsInterfaces.td"
+include "mlir/Dialect/Bufferization/IR/BufferizableOpInterface.td"
+include "mlir/Interfaces/DestinationStyleOpInterface.td"
+include "mlir/IR/OpAsmInterface.td"
+
+// Minimal scaffolding op: ViewLayout
+
+def D2M_ViewLayoutOp
+    : D2M_Op<
+          "view_layout",
+          [Pure, D2M_ViewOpInterface,
+           DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmResultNames"]>,
+           DeclareOpInterfaceMethods<BufferizableOpInterface,
+                                     ["bufferizesToMemoryRead",
+                                      "bufferizesToMemoryWrite", "bufferize",
+                                      "getAliasingValues", "getBufferType"]>]> {
+  let summary = "View Layout op (D2M subset)";
+  let description = [{
+    Create a representational view of a tensor/memref with a different layout.
+    This is a no-op for codegen; consumers are expected to compose layouts.
+
+    The `remapping` attr describes the exact remapping this op represents.
+  }];
+
+  let arguments = (ins AnyRankedTensorOrMemRef:$input,
+                       AffineMapAttr:$remapping,
+                       DefaultValuedAttr<BoolAttr, "false">:$reinterpretLayout);
+  let results = (outs AnyRankedTensorOrMemRef:$result);
+
+  let assemblyFormat = [{
+    $input `remapping` `=` $remapping attr-dict `:` type($input) `->` type($result)  }];
+
+  let builders = [OpBuilder<(ins "Type":$outputType, "Value":$input)>];
+
+  let extraClassDeclaration = [{
+    bool isReblockOnly();
+  }];
+
+  let hasVerifier = 1;
+  let hasFolder = 1;
+  let hasCanonicalizer = 1;
+}
+
+def D2M_CompositeViewOp : D2M_Op<"composite_view",
+                                 [Pure, D2M_ViewOpInterface,
+                                  DeclareOpInterfaceMethods<D2M_ViewOpInterface,
+                                                            ["getInput",
+                                                             "isComposite",
+                                                             "getCompositeInputs"]>,
+                                  DeclareOpInterfaceMethods<BufferizableOpInterface,
+                                                            ["bufferizesToMemoryRead",
+                                                             "bufferizesToMemoryWrite",
+                                                             "bufferize",
+                                                             "getAliasingValues",
+                                                             "getBufferType"]>]> {
+  let summary = "Piecewise view over multiple input tensors";
+  let description = [{
+    Represents a piecewise-affine view that aggregates multiple input tensors
+    along a certain dimension.
+    The optional `logicalSizes` attribute records the logical sizes of the
+    inputs along `dim`, which is required for row-major inputs.
+  }];
+
+  let arguments = (ins Variadic<AnyRankedTensorOrMemRef>:$inputs,
+                       SI32Attr:$dim,
+                       OptionalAttr<DenseI64ArrayAttr>:$logicalSizes);
+
+  let results = (outs AnyRankedTensorOrMemRef:$result);
+
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// Layout transition and streaming ops (D2M variants)
+//===----------------------------------------------------------------------===//
+
+def D2M_ToLayoutOp
+    : D2M_Op<
+          "to_layout",
+          [DeclareOpInterfaceMethods<
+               BufferizableOpInterface, ["bufferizesToMemoryRead",
+                                         "bufferizesToMemoryWrite", "bufferize",
+                                         "getAliasingValues", "getBufferType"]>,
+           DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
+  let summary = "Layout op.";
+  let description = [{
+      ToLayout operation, transition tensors from one layout to another.  Some examples include:
+        - Transitioning between different memory spaces, e.g. DRAM to L1.
+        - Transitioning between different data types, e.g. f32 to f16.
+        - Transitioning between different tile sizes, e.g. 1x16 to 32x32
+        - Transitioning between different tensor sharding
+        - Some combination of the above
+
+      ```mlir
+      #layout = #ttcore.metal_layout<logical_shape = 64x128, dim_alignments = 32x32, collapsed_intervals = dense<[[0, 1], [1, 2]]> : tensor<2x2xi64>, system, sharded>
+      #layout1 = #ttcore.metal_layout<logical_shape = 64x128, dim_alignments = 32x32, collapsed_intervals = dense<[[0, 1], [1, 2]]> : tensor<2x2xi64>, l1, sharded>
+      %1 = "d2m.to_layout"(%arg0, %0) : (tensor<64x128xf32, #layout>, tensor<64x128xf32, #layout1>) -> tensor<64x128xf32, #layout1>
+      ```
+    }];
+
+  let arguments = (ins AnyRankedTensorOrMemRef:$input, AnyRankedTensorOrMemRef:$output);
+  let results = (outs Variadic<AnyRankedTensor>:$results);
+
+  let assemblyFormat =
+      [{ $input `,` $output `:` type($input) `into` type($output) attr-dict (`->` type($results)^)? }];
+
+  let builders = [OpBuilder<(ins "Value":$input, "Value":$output), [{
+        build($_builder, $_state, {output.getType()}, input, output);
+      }]>,
+  ];
+
+  let extraClassDeclaration = [{
+      bool isHostToDevice();
+      bool isDeviceToHost();
+    }];
+
+  let hasVerifier = 1;
+  let hasFolder = 1;
+  let hasCanonicalizer = 1;
+}
+
+def D2M_MaskOp
+    : D2M_Op<
+          "mask",
+          [DeclareOpInterfaceMethods<
+               BufferizableOpInterface, ["bufferizesToMemoryRead",
+                                         "bufferizesToMemoryWrite", "bufferize",
+                                         "getAliasingValues", "getBufferType"]>,
+           DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
+  let summary = "Mask tensor padding outside logical bounds with a fill value";
+  let description = [{
+      `d2m.mask` materializes a padding contract for a tiled tensor. Elements
+      outside `logicalShape` are replaced with `fill_value`; elements inside
+      the logical bounds are copied from `input`.
+
+      This is a tensor-level operation. `d2m-decompose-masking` lowers it to
+      explicit per-core masking loops after bufferization.
+    }];
+
+  let arguments = (ins AnyRankedTensorOrMemRef:$input,
+                       AnyRankedTensorOrMemRef:$output,
+                       DenseI64ArrayAttr:$logicalShape,
+                       TTCore_OOBValAttr:$fill_value);
+  let results = (outs AnyRankedTensorOrMemRef:$result);
+
+  let assemblyFormat =
+      [{ $input `,` $output `logical_shape` `=` $logicalShape `fill_value` `=` $fill_value attr-dict `:` type($input) `into` type($output) `->` type($result) }];
+
+  let builders = [OpBuilder<(ins "Value":$input, "Value":$output,
+                                "ArrayRef<int64_t>":$logicalShape,
+                                "ttcore::OOBVal":$fillValue),
+                            [{
+        build($_builder, $_state, output.getType(), input, output,
+              $_builder.getDenseI64ArrayAttr(logicalShape),
+              ttcore::OOBValAttr::get($_builder.getContext(), fillValue));
+      }]>,
+  ];
+
+  let extraClassDeclaration = [{
+      MutableOperandRange getDpsInitsMutable() { return getOutputMutable(); }
+    }];
+
+  let hasVerifier = 1;
+  let hasFolder = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// Host-Device Transfer Ops
+//===----------------------------------------------------------------------===//
+
+def D2M_ToDeviceOp
+    : D2M_Op<
+          "to_device",
+          [DeclareOpInterfaceMethods<
+               BufferizableOpInterface, ["bufferizesToMemoryRead",
+                                         "bufferizesToMemoryWrite", "bufferize",
+                                         "getAliasingValues", "getBufferType"]>,
+           DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
+  let summary = "Transfer data from host to device.";
+  let description = [{
+      ToDevice operation transfers tensor data from host (system) memory to device memory.
+      This is the explicit host-to-device data movement operation that replaces the
+      overloaded system transfer case of ToLayoutOp.
+
+      The `layout` attribute stores the device layout information needed for the transfer.
+
+      ```mlir
+      #layout = #ttcore.metal_layout<logical_shape = 64x128, dim_alignments = 32x32, collapsed_intervals = dense<[[0, 1], [1, 2]]> : tensor<2x2xi64>, l1, sharded>
+      %1 = d2m.to_device %arg0, %0 layout = #layout : tensor<64x128xf32> into tensor<64x128xf32, #layout>
+      ```
+    }];
+
+  let arguments = (ins AnyRankedTensorOrAnyMemRef:$input,
+                       AnyRankedTensorOrAnyMemRef:$output,
+                       TTCore_MetalLayoutAttr:$layout);
+  let results = (outs Variadic<AnyRankedTensor>:$results);
+
+  let assemblyFormat =
+      [{ $input `,` $output `layout` `=` $layout attr-dict `:` type($input) `into` type($output) (`->` type($results)^)? }];
+
+  let builders = [OpBuilder<(ins "Value":$input, "Value":$output,
+                                "ttcore::MetalLayoutAttr":$layout),
+                            [{
+        build($_builder, $_state, {output.getType()}, input, output, layout);
+      }]>,
+  ];
+
+  let hasVerifier = 1;
+}
+
+def D2M_ToHostOp
+    : D2M_Op<
+          "to_host", [DeclareOpInterfaceMethods<
+                          BufferizableOpInterface,
+                          ["bufferizesToMemoryRead", "bufferizesToMemoryWrite",
+                           "bufferize", "getAliasingValues", "getBufferType"]>,
+                      DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
+  let summary = "Transfer data from device to host.";
+  let description = [{
+      ToHost operation transfers tensor data from device memory to host (system) memory.
+      This is the explicit device-to-host data movement operation that replaces the
+      overloaded system transfer case of ToLayoutOp.
+
+      The `layout` attribute stores the device layout information needed for the transfer.
+
+      ```mlir
+      #layout = #ttcore.metal_layout<logical_shape = 64x128, dim_alignments = 32x32, collapsed_intervals = dense<[[0, 1], [1, 2]]> : tensor<2x2xi64>, l1, sharded>
+      %1 = d2m.to_host %arg0, %0 layout = #layout : tensor<64x128xf32, #layout> into tensor<64x128xf32>
+      ```
+    }];
+
+  let arguments = (ins AnyRankedTensorOrAnyMemRef:$input,
+                       AnyRankedTensorOrAnyMemRef:$output,
+                       TTCore_MetalLayoutAttr:$layout);
+  let results = (outs Variadic<AnyRankedTensor>:$results);
+
+  let assemblyFormat =
+      [{ $input `,` $output `layout` `=` $layout attr-dict `:` type($input) `into` type($output) (`->` type($results)^)? }];
+
+  let builders = [OpBuilder<(ins "Value":$input, "Value":$output,
+                                "ttcore::MetalLayoutAttr":$layout),
+                            [{
+        build($_builder, $_state, {output.getType()}, input, output, layout);
+      }]>,
+  ];
+
+  let hasVerifier = 1;
+}
+
+def D2M_GenericOp
+    : D2M_Op<
+          "generic",
+          [AttrSizedOperandSegments, NoTerminator, DestinationStyleOpInterface,
+           DeclareOpInterfaceMethods<
+               OpAsmOpInterface, ["getAsmBlockArgumentNames",
+                                  "getAsmBlockNames"]>,
+           DeclareOpInterfaceMethods<
+               BufferizableOpInterface, ["bufferizesToMemoryRead",
+                                         "bufferizesToMemoryWrite", "bufferize",
+                                         "getAliasingValues", "getBufferType",
+                                         "isWritable", "hasTensorSemantics",
+]>,
+           DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
+  let summary = "Generically dispatch work to a grid of cores (D2M).";
+  let description = [{
+      Same semantics as D2M generic; carries regions for compute/datamovement
+      to be consumed by the metal path.
+    }];
+
+  let arguments = (ins Variadic<AnyRankedTensorOrMemRef>:$inputs,
+                       Variadic<AnyRankedTensorOrMemRef>:$outputs,
+                       Variadic<AnyType>:$additionalArgs,
+                       TTCore_GridAttr:$grid,
+                       I64ArrayAttr:$block_factors, AffineMapArrayAttr:$indexing_maps,
+                       TTCore_IteratorTypeArrayAttr:$iterator_types,
+                       D2M_ThreadArrayAttr:$threads,
+                       OptionalAttr<TTCore_FabricConnectionConfigAttr>:$fabricConnectionConfig);
+  let results = (outs Variadic<AnyRankedTensor>:$results);
+  let regions = (region VariadicRegion<AnyRegion>:$regions);
+
+  // Keep this format in sync with GenericOp::parse/print. Empty blocks must
+  // print their block label so a present-but-empty region roundtrips as a
+  // one-block region:
+  //
+  //   d2m.generic {threads = [#d2m.thread<datamovement>, #d2m.thread<compute>]}
+  //       ins()
+  //       outs(%arg0 : memref<1xf32, #l1>) {
+  //   ^datamovement0:
+  //   }, {
+  //   ^compute0:
+  //   }
+  let hasCustomAssemblyFormat = 1;
+
+  let hasVerifier = 1;
+  let hasCanonicalizer = 1;
+
+  let builders =
+      [OpBuilder<(ins "ValueRange":$inputs, "ValueRange":$outputs, "ValueRange":$additionalArgs,
+           "ArrayAttr":$indexingMaps, "ArrayAttr":$iteratorTypes,
+           CArg<"ThreadType", "ThreadType::Compute">:$singleThreadType,
+           CArg<"ttcore::GridAttr", "nullptr">:$grid,
+           CArg<"ArrayRef<int64_t>", "{}">:$blockFactors)>,
+       OpBuilder<(ins "ValueRange":$inputs, "ValueRange":$outputs, "ValueRange":$additionalArgs,
+           "ArrayAttr":$indexingMaps, "ArrayAttr":$iteratorTypes,
+           "llvm::function_ref<void(OpBuilder&, Location, "
+           "ValueRange)>":$singleThreadRegionBuilder,
+           CArg<"ThreadType", "ThreadType::Compute">:$singleThreadType,
+           CArg<"ttcore::GridAttr", "nullptr">:$grid,
+           CArg<"ArrayRef<int64_t>", "{}">:$blockFactors)>,
+       OpBuilder<(ins "ValueRange":$inputs, "ValueRange":$outputs, "ValueRange":$additionalArgs,
+           "llvm::function_ref<void(OpBuilder&, Location, "
+           "ValueRange)>":$singleThreadRegionBuilder,
+           CArg<"ThreadType", "ThreadType::Compute">:$singleThreadType,
+           CArg<"ttcore::GridAttr", "nullptr">:$grid,
+           CArg<"ArrayRef<int64_t>", "{}">:$blockFactors)>,
+  ];
+
+    let builders = [
+      OpBuilder<(ins "ValueRange": $inputs,
+                     "ValueRange": $outputs,
+                     "ValueRange": $additionalArgs,
+                     "ArrayAttr": $indexingMaps,
+                     "ArrayAttr": $iteratorTypes,
+                     CArg<"ThreadType", "ThreadType::Unified">: $singleThreadType,
+                     CArg<"ttcore::GridAttr", "nullptr">: $grid,
+                     CArg<"ArrayRef<int64_t>", "{}">: $blockFactors,
+                     CArg<"ttcore::FabricConnectionConfigAttr", "nullptr">: $fabricConnectionConfig)>,
+      OpBuilder<(ins "ValueRange": $inputs,
+                     "ValueRange": $outputs,
+                     "ValueRange": $additionalArgs,
+                     "ArrayAttr": $indexingMaps,
+                     "ArrayAttr": $iteratorTypes,
+                     "llvm::function_ref<void(OpBuilder&, Location, ValueRange)>": $singleThreadRegionBuilder,
+                     CArg<"ThreadType", "ThreadType::Unified">: $singleThreadType,
+                     CArg<"ttcore::GridAttr", "nullptr">: $grid,
+                     CArg<"ArrayRef<int64_t>", "{}">: $blockFactors,
+                     CArg<"ttcore::FabricConnectionConfigAttr", "nullptr">: $fabricConnectionConfig)>,
+      OpBuilder<(ins "ValueRange": $inputs,
+                     "ValueRange": $outputs,
+                     "ValueRange": $additionalArgs,
+                     "llvm::function_ref<void(OpBuilder&, Location, ValueRange)>": $singleThreadRegionBuilder,
+                     CArg<"ThreadType", "ThreadType::Unified">: $singleThreadType,
+                     CArg<"ttcore::GridAttr", "nullptr">: $grid,
+                     CArg<"ArrayRef<int64_t>", "{}">: $blockFactors,
+                     CArg<"ttcore::FabricConnectionConfigAttr", "nullptr">: $fabricConnectionConfig)>,
+    ];
+
+    let extraClassDeclaration = [{
+      // Required by DestinationStyleOpInterface
+      MutableOperandRange getDpsInitsMutable() {
+        return getOutputsMutable();
+      }
+      static std::pair<ArrayAttr, ArrayAttr> buildParallelAffineMapsAndIteratorTypes(mlir::OpBuilder &builder, size_t arity, size_t rank) {
+        auto map = builder.getMultiDimIdentityMap(rank);
+        Attribute parallel = builder.getAttr<ttcore::IteratorTypeAttr>(ttcore::IteratorType::Parallel);
+        return std::make_pair(builder.getAffineMapArrayAttr(SmallVector<AffineMap>(arity, map)),
+                              builder.getArrayAttr(SmallVector<Attribute>(rank, parallel)));
+      }
+      ThreadType getRegionThreadType(unsigned regionIndex) {
+        auto arr = getThreadsAttr().getValue();
+        return mlir::cast<ThreadAttr>(arr[regionIndex]).getThreadType();
+      }
+      SmallVector<ttcore::IteratorType> getIteratorTypesValue();
+      bool isComputeOnlyForm() {
+        for (unsigned i = 0; i < getNumRegions(); ++i) {
+          if (hasComputeOpsInRegion(i)) {
+            return true;
+          }
+        }
+        return false;
+      }
+      bool isDMAOnlyForm() {
+        if (getNumRegions() == 0) {
+          return false;
+        }
+        for (unsigned i = 0; i < getNumRegions(); ++i) {
+          if (hasComputeOpsInRegion(i)) {
+            return false;
+          }
+        }
+        return true;
+      }
+      bool isImplicitBlockedForm();
+      bool isAffineBlockedForm();
+      bool isExplicitDatamovementForm() {
+        return getBlockFactors().empty() &&
+               getIndexingMaps().empty() &&
+               getIteratorTypes().empty();
+      }
+      bool isUnifiedForm() {
+        return getNumRegions() == 1 &&
+               getRegionThreadType(0) == ThreadType::Unified;
+      }
+      bool isExternalSymbolForm() { return getRegions().empty(); }
+      SmallVector<SmallVector<int64_t>> getInputOutputOperandGridShapes();
+      SmallVector<int64_t> getLoopBounds();
+      SmallVector<AffineMap> getIndexingMapsValue();
+      SmallVector<int64_t> getBlockFactorsValue();
+      SmallVector<int64_t> getFullBlockFactors();
+      ttcore::DeviceAttr getDevice();
+      SmallVector<int64_t> getParticipatingLoopDims(int64_t operandIndex);
+      SmallVector<int64_t> getNonParticipatingLoopDims(int64_t operandIndex);
+      SmallVector<int64_t> getPhysicalGridShape();
+      SmallVector<SmallVector<int64_t>> getInputOutputOperandShardShapes(bool convertTileToScalar = false);
+      std::optional<SmallVector<int64_t>> computeGridDimConstraints(std::function<bool(ttcore::MetalLayoutAttr, bool)> operandFilterPredicate);
+      unsigned getNumLoops();
+      unsigned getNumDims();
+      unsigned getNumBlockFactors();
+      AffineMap getIndexingMap(int64_t operandIndex);
+      AffineMap getIndexingMapForOperand(Value operand);
+      AffineMap getOutputIndexingMap();
+      std::optional<unsigned> getOutputOperandIndex(Value operand);
+      SmallVector<int64_t> getOutputGridDimPositions();
+      int64_t getOperandIndex(Value operand);
+      bool hasCompatibleBlocking(GenericOp gOp);
+      bool hasSkipOpEltwiseFusionTrait();
+      bool hasReduction();
+      bool hasMultiUseInputOperand();
+      bool isAllParallel();
+      bool hasComputeOpsInRegion(unsigned regionIndex = 0);
+      bool isNontriviallyEltwiseFused();
+      FailureOr<ParallelizedGeneric> withParallelization(
+          OpBuilder &builder, std::optional<ttcore::GridAttr> newGrid,
+          std::optional<ArrayRef<int64_t>> newBlockFactors,
+          bool generateReturnView = true);
+      static Value findAssocOperand(memref::AllocOp allocOp);
+      static Value findAssocOperand(::mlir::tensor::EmptyOp emptyOp);
+
+      /// Get the allocation (tensor.empty or memref.alloc) op result at
+      /// position `operandIndex` from the region's first block using
+      /// positional counting.  Returns null if not found.
+      static Value getOperandAlloc(Region &region, unsigned operandIndex);
+
+      // Declare methods here - they go in the .h.inc file
+      ::mlir::Operation::operand_range getInputsAndOutputs();
+      MutableArrayRef<OpOperand> getInputsAndOutputsMutable();
+      bool isOutputOperandIdx(unsigned int operandIndex);
+    }];
+}
+def D2M_SpatialOp: D2M_Op<"spatial",
+[ AttrSizedOperandSegments
+  , NoTerminator
+  , DestinationStyleOpInterface
+  , DeclareOpInterfaceMethods<BufferizableOpInterface, [
+      "bufferizesToMemoryRead",
+      "bufferizesToMemoryWrite",
+      "bufferize",
+      "getAliasingValues",
+      "getBufferType",
+      "isWritable",
+      "hasTensorSemantics",
+    ]>
+  , DeclareOpInterfaceMethods<MemoryEffectsOpInterface>
+  ]> {
+    let summary = "Execute multiple d2m.generic ops simultaneously on disjoint grid ranges of the device.";
+    let description = [{
+      Execute multiple d2m.generic ops simultaneously on disjoint parts of the physical
+      device. Each region corresponds to one grid range in `grid_ranges` and contains
+      exactly one d2m.generic op. Grid ranges must be non-overlapping and contained
+      in the device.
+    }];
+
+    let arguments = (ins Variadic<AnyRankedTensorOrMemRef>:$inputs,
+                         Variadic<AnyRankedTensorOrMemRef>:$outputs,
+                         TTCore_CoreRangeArrayAttr:$grid_ranges);
+    let results = (outs Variadic<AnyRankedTensor>:$results);
+    let regions = (region VariadicRegion<AnyRegion>:$regions);
+
+    let assemblyFormat = [{ attr-dict `\n`
+    ` ` ` ` ` ` ` ` `ins` `(` $inputs (`:` type($inputs)^)? `)` `\n`
+    ` ` ` ` ` ` ` ` `outs` `(` $outputs  `:` type($outputs) `)` ` `  $regions (`:`  type($results)^ )?
+    }];
+
+    let hasVerifier = 1;
+
+    let extraClassDeclaration = [{
+      // Required by DestinationStyleOpInterface
+      MutableOperandRange getDpsInitsMutable() {
+        return getOutputsMutable();
+      }
+    }];
+}
+
+// Simple creation op needed by LowerToLayout splitting
+
+def D2M_EmptyOp
+    : D2M_Op<
+          "empty", [DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
+                    DeclareOpInterfaceMethods<
+                        BufferizableOpInterface,
+                        ["bufferizesToMemoryRead", "bufferizesToMemoryWrite",
+                         "bufferize", "getAliasingValues", "getBufferType"]>]> {
+  let summary = "Empty tensor allocation operation (D2M).";
+  let description = [{
+    Create an uninitialized tensor with the specified shape, element type and encoding.
+
+    Optionally, the `virtualGridInverseMapping` attribute stores the inverse affine
+    map (physical to virtual grid coordinates) and `virtualGridForwardMapping`
+    stores the forward affine map (virtual to physical grid coordinates).
+  }];
+
+  let arguments = (ins OptionalAttr<AffineMapAttr>:$virtualGridInverseMapping,
+                       OptionalAttr<AffineMapAttr>:$virtualGridForwardMapping);
+  let results = (outs AnyRankedTensor:$result);
+
+  let builders = [
+    OpBuilder<(ins "ArrayRef<int64_t>":$shape, "Type":$elementType,
+                   "Attribute":$encoding), [{
+      build($_builder, $_state,
+            RankedTensorType::get(shape, elementType, encoding),
+            /*virtualGridInverseMapping=*/nullptr,
+            /*virtualGridForwardMapping=*/nullptr);
+    }]>,
+    OpBuilder<(ins "ArrayRef<int64_t>":$shape, "Type":$elementType), [{
+      build($_builder, $_state, shape, elementType, nullptr);
+    }]>,
+    // Builder that computes and sets virtual grid mapping attrs when the
+    // tensor's grid requires virtualization for the given target device grid.
+    OpBuilder<(ins "ArrayRef<int64_t>":$shape, "Type":$elementType,
+                   "Attribute":$encoding,
+                   "ArrayRef<int64_t>":$targetGridShape)>,
+  ];
+
+  let assemblyFormat = "`(` `)` attr-dict `:` type($result)";
+}
+
+def D2M_CreateGlobalSemaphoreOp : D2M_Op<"create_global_semaphore",
+    [DeclareOpInterfaceMethods<BufferizableOpInterface,
+      ["bufferizesToMemoryRead", "bufferizesToMemoryWrite",
+       "getAliasingValues", "bufferize"]>]> {
+  let summary = "Global semaphore allocation operation (D2M).";
+
+  let description = [{
+    Create an uninitialized global semaphore with the specified core range.
+  }];
+
+  let arguments = (ins AnyRankedTensorOrMemRef:$input, OptionalAttr<UI32Attr>:$value);
+  let results = (outs D2M_GlobalSemaphore:$result);
+
+  let assemblyFormat = "`(` $input `)` attr-dict `:` type($input) `->` type($result)";
+  let hasVerifier = 1;
+}
+
+def D2M_ResetGlobalSemaphoreOp : D2M_Op<"reset_global_semaphore"> {
+  let summary = "Global semaphore reset operation (D2M).";
+
+  let description = [{
+    Reset global semaphore to a specific value. This operation blocks until the value has been set.
+  }];
+
+  let arguments = (ins D2M_GlobalSemaphore:$semaphore, UI32Attr:$value);
+  let results = (outs);
+
+  let assemblyFormat = [{ `(` $semaphore `)` attr-dict `:` type($semaphore) }];
+}
+
+def D2M_CreateLocalSemaphoreOp : D2M_Op<"create_local_semaphore"> {
+  let summary = "Create local semaphore op.";
+
+  let description = [{
+    This operation is a representational op. It creates a local semaphore in the core range within the generic op in which it is consumed.
+  }];
+
+  let arguments = (ins UI32Attr:$initialValue);
+  let results = (outs D2M_LocalSemaphore:$result);
+  let assemblyFormat = "prop-dict attr-dict `->` type($result)";
+}
+
+def D2M_MeshShardOp
+    : D2M_Op<"mesh_shard",
+             [Pure, DeclareOpInterfaceMethods<
+                        BufferizableOpInterface,
+                        ["bufferizesToMemoryRead", "bufferizesToMemoryWrite",
+                         "bufferize", "getAliasingValues", "getBufferType"]>]> {
+  let summary = "Mesh shard operation (D2M).";
+  let description = [{
+    MeshShard op shards the inputs (FullToShard) or concatenates the outputs (ShardToFull) for ccl ops.
+  }];
+
+  let arguments = (ins AnyRankedTensorOrMemRef:$input,
+                       TTCore_MeshShardTypeAttr:$shard_type,
+                       TTCore_MeshShardDirectionAttr:$shard_direction,
+                       DenseI64ArrayAttr:$shard_shape,
+                       DenseI64ArrayAttr:$shard_dims);
+
+  let results = (outs AnyRankedTensorOrMemRef:$result);
+
+  let extraClassDefinition = [{
+    bool $cppClass::bufferizesToMemoryRead(
+        mlir::OpOperand &operand, const mlir::bufferization::AnalysisState &) {
+      return true;
+    }
+    bool $cppClass::bufferizesToMemoryWrite(
+        mlir::OpOperand &operand, const mlir::bufferization::AnalysisState &) {
+      return false;
+    }
+    bufferization::AliasingValueList $cppClass::getAliasingValues(
+        OpOperand &, const bufferization::AnalysisState &) {
+      bufferization::AliasingValueList result;
+      return result;
+    }
+  }];
+
+  let assemblyFormat = "$input attr-dict `:` type($input) `->` type($result)";
+  let hasVerifier = 1;
+  let hasFolder = 1;
+}
+
+#endif // TTMLIR_TTMLIR_DIALECT_D2M_D2MOPS_TD

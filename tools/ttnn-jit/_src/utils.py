@@ -1,0 +1,117 @@
+# SPDX-FileCopyrightText: (c) 2025 Tenstorrent AI ULC
+#
+# SPDX-License-Identifier: Apache-2.0
+
+import textwrap
+import inspect
+from typing import Callable
+from ttnn_jit.ttmlir.ir import *
+from ttnn_jit._src.tensor_translator import (
+    _calculate_tile_shape,
+    _get_logical_tensor_shape,
+)
+
+
+def discover_dialect_ops(dialect, denylist=None):
+    """
+    Return a mapping Dict[str, Callable] of available pybounded dialect ops.
+    """
+    # Convert string dialect names to their corresponding objects
+    if isinstance(dialect, str):
+        dialect = importlib.import_module(f"ttnn_jit.ttmlir.dialects.{dialect}")
+
+    denylist = set() if denylist is None else denylist
+    op_map = {}
+    ns = dialect.__name__.split("ttmlir.dialects.")[-1]
+    for attr_name in dir(dialect):
+        if attr_name.startswith("_"):
+            continue
+        op_obj = getattr(dialect, attr_name, None)
+        if (
+            op_obj is None
+            or not hasattr(op_obj, "OPERATION_NAME")
+            or not inspect.isclass(op_obj)
+        ):
+            continue
+
+        func_name = getattr(op_obj, "OPERATION_NAME")
+        name = func_name.removeprefix(ns + ".")
+        if name in denylist:
+            continue
+        func = getattr(dialect, name, None)
+
+        # must be the module-level function, and not the class
+        if inspect.isfunction(func):
+            op_map[name] = func
+
+    return op_map
+
+
+def cleanup_source_code(f: Callable):
+    source_code = inspect.getsource(f)
+    source_code = textwrap.dedent(source_code)
+
+    # Find the line that starts the function definition and keep from there
+    lines = source_code.splitlines()
+    def_line_idx = None
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("def "):
+            def_line_idx = i
+            break
+
+    if def_line_idx is None:
+        # Fallback to old behavior if we can't find def line
+        cleaned = [line for line in lines if not line.strip().startswith("@")]
+        source_code = "\n".join(cleaned)
+    else:
+        # Keep only from the def line onwards (removes all decorator lines)
+        source_code = "\n".join(lines[def_line_idx:])
+
+    return source_code
+
+
+def get_maximal_block_sharding_grid(shape, core_grid):
+    """Infer a TTNN grid/end coord for block sharding the given logical tensor shape and device core grid
+    Note: core_grid parameter expects index starting at 0, e.g. (7, 7) for an 8x8 grid
+    """
+    logical_shape = _get_logical_tensor_shape(shape)
+    tile_shape = _calculate_tile_shape(logical_shape)
+
+    # modify core_grid to starting index 1
+    core_grid = [dim + 1 for dim in core_grid]
+
+    grid = []
+    for dim, max_grid in zip(tile_shape, reversed(core_grid)):
+        for grid_dim in reversed(range(max_grid)):
+            if dim % (grid_dim + 1) == 0:
+                grid.append(grid_dim)
+                break
+    return list(reversed(grid))
+
+
+def get_core_grid_from_tensor_args(tensor_args):
+    """Get the core grid from the device of the first tensor argument"""
+
+    if not tensor_args:
+        raise ValueError("No tensor arguments provided")
+    tensor_arg = next(iter(tensor_args.values()))
+    device = tensor_arg.device()
+    return (device.core_grid.x - 1, device.core_grid.y - 1)
+
+
+def get_mesh_shape_from_tensor_args(tensor_args):
+    """
+    Get the mesh shape (rows, cols) from the device of the first tensor argument.
+
+    For a mesh device, returns (mesh_rows, mesh_cols) from device.shape.
+    For a single device (shape.dims() < 2), returns (1, 1).
+    """
+    if not tensor_args:
+        return (1, 1)
+    tensor_arg = next(iter(tensor_args.values()))
+    device = tensor_arg.device()
+    shape = device.shape
+    if shape.dims() >= 2:
+        return (int(shape[0]), int(shape[1]))
+    return (1, 1)

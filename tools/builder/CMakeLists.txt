@@ -1,0 +1,37 @@
+include(AddMLIRPython)
+
+declare_mlir_python_sources(BuilderSources
+  ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}"
+  SOURCES
+    # builder
+    base/__init__.py
+    base/builder.py
+    base/builder_utils.py
+    base/builder_runtime.py
+    base/builder_apis.py
+    base/builder_enums.py
+    base/input_range_constraints.py
+
+    # ttir subpackage files
+    ttir/__init__.py
+    ttir/ttir_builder.py
+
+    # stablehlo subpackage files
+    stablehlo/__init__.py
+    stablehlo/stablehlo_builder.py
+    stablehlo/shardy_parallelization_utils.py
+
+    # d2m subpackage files
+    d2m/__init__.py
+    d2m/d2m_builder.py
+
+    # ttnn subpackage files
+    ttnn/__init__.py
+    ttnn/ttnn_builder.py
+)
+
+add_mlir_python_modules(BuilderPythonModules
+  ROOT_PREFIX "${TTMLIR_PYTHON_PACKAGES_DIR}/builder"
+  INSTALL_PREFIX "python_packages/builder"
+  DECLARED_SOURCES BuilderSources
+)

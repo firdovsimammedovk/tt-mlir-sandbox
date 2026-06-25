@@ -1,0 +1,106 @@
+// SPDX-FileCopyrightText: (c) 2024 Tenstorrent AI ULC
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#ifndef TTMLIR_OPMODEL_TTNN_METALHEADERS_H
+#define TTMLIR_OPMODEL_TTNN_METALHEADERS_H
+
+#define FMT_HEADER_ONLY
+
+#include "tt-metalium/bfloat16.hpp"
+#include "tt-metalium/buffer.hpp"
+#include "tt-metalium/buffer_types.hpp"
+#include "tt-metalium/core_coord.hpp"
+#include "tt-metalium/device.hpp"
+#include "tt-metalium/experimental/mock_device/mock_device.hpp"
+#include "tt-metalium/host_api.hpp"
+#include "ttnn/graph/graph_processor.hpp"
+// using namespace removed in metal
+// but IDevice cannot be resolved by "ttnn/graph/graph_query_op_constraints.hpp"
+using IDevice = ::tt::tt_metal::IDevice;
+// allocator header include required by
+// "ttnn/graph/graph_query_op_constraints.hpp"
+#include "tt-metalium/allocator.hpp"
+#include "ttnn/operations/pool/generic/generic_pools.hpp"
+
+// Add missing extract_output_tensor overload for MaxPoolWithIndicesResult
+// This should be in the metal repo but is missing from commit 5965834630
+namespace ttnn::graph::detail {
+inline Tensor
+extract_output_tensor(const std::tuple<Tensor, Tensor, Tensor> &result) {
+  return std::get<0>(result);
+}
+} // namespace ttnn::graph::detail
+
+#include "ttnn/graph/graph_query_op_constraints.hpp"
+#include "ttnn/graph/graph_query_op_runtime.hpp"
+#include "ttnn/graph/graph_trace_utils.hpp"
+#include "ttnn/operations/ccl/mesh_partition/mesh_partition.hpp"
+#include "ttnn/operations/conv/conv2d/conv2d.hpp"
+#include "ttnn/operations/conv/conv2d/prepare_conv2d_weights.hpp"
+#include "ttnn/operations/conv/conv_transpose2d/conv_transpose2d.hpp"
+#include "ttnn/operations/conv/conv_transpose2d/prepare_conv_transpose2d_weights.hpp"
+#include "ttnn/operations/copy/typecast/typecast.hpp"
+#include "ttnn/operations/core/core.hpp"
+#include "ttnn/operations/creation/creation.hpp"
+#include "ttnn/operations/data_movement/concat/concat.hpp"
+#include "ttnn/operations/data_movement/copy/copy.hpp"
+#include "ttnn/operations/data_movement/gather/gather.hpp"
+#include "ttnn/operations/data_movement/pad/pad.hpp"
+#include "ttnn/operations/data_movement/permute/permute.hpp"
+#include "ttnn/operations/data_movement/repeat/repeat.hpp"
+#include "ttnn/operations/data_movement/repeat_interleave/repeat_interleave.hpp"
+#include "ttnn/operations/data_movement/reshape_view/reshape.hpp"
+#include "ttnn/operations/data_movement/scatter/scatter.hpp"
+#include "ttnn/operations/data_movement/slice/slice.hpp"
+#include "ttnn/operations/data_movement/sort/sort.hpp"
+#include "ttnn/operations/data_movement/transpose/transpose.hpp"
+#include "ttnn/operations/eltwise/binary/binary.hpp"
+#include "ttnn/operations/eltwise/binary/binary_composite.hpp"
+#include "ttnn/operations/eltwise/quantization/quantization.hpp"
+#include "ttnn/operations/eltwise/unary/common/unary_op_types.hpp"
+#include "ttnn/operations/eltwise/unary/unary.hpp"
+#include "ttnn/operations/eltwise/unary/unary_composite.hpp"
+#include "ttnn/operations/embedding/embedding.hpp"
+#include "ttnn/operations/embedding_backward/embedding_backward.hpp"
+#include "ttnn/operations/experimental/ccl/all_reduce_async/all_reduce_async.hpp"
+#include "ttnn/operations/experimental/conv3d/conv3d.hpp"
+#include "ttnn/operations/experimental/conv3d/prepare_conv3d_weights.hpp"
+#include "ttnn/operations/experimental/dropout/dropout.hpp"
+#include "ttnn/operations/experimental/paged_cache/paged_cache.hpp"
+#include "ttnn/operations/experimental/topk_router_gpt/topk_router_gpt.hpp"
+#include "ttnn/operations/experimental/transformer/nlp_concat_heads/nlp_concat_heads.hpp"
+#include "ttnn/operations/experimental/transformer/nlp_concat_heads_decode/nlp_concat_heads_decode.hpp"
+#include "ttnn/operations/experimental/transformer/nlp_create_qkv_heads_decode/nlp_create_qkv_heads_decode.hpp"
+#include "ttnn/operations/experimental/transformer/rotary_embedding/rotary_embedding.hpp"
+#include "ttnn/operations/experimental/transformer/rotary_embedding_llama/rotary_embedding_llama.hpp"
+#include "ttnn/operations/experimental/unary_backward/gelu_backward/gelu_backward.hpp"
+#include "ttnn/operations/kv_cache/kv_cache.hpp"
+#include "ttnn/operations/matmul/matmul.hpp"
+#include "ttnn/operations/normalization/batch_norm/batch_norm.hpp"
+#include "ttnn/operations/normalization/groupnorm/groupnorm.hpp"
+#include "ttnn/operations/normalization/layernorm/layernorm.hpp"
+#include "ttnn/operations/normalization/layernorm_distributed/layernorm_post_all_gather.hpp"
+#include "ttnn/operations/normalization/layernorm_distributed/layernorm_pre_all_gather.hpp"
+#include "ttnn/operations/normalization/rmsnorm/rmsnorm.hpp"
+#include "ttnn/operations/normalization/rmsnorm_distributed/rmsnorm_pre_all_gather.hpp"
+#include "ttnn/operations/normalization/softmax/softmax.hpp"
+#include "ttnn/operations/pool/upsample/upsample.hpp"
+#include "ttnn/operations/rand/rand.hpp"
+#include "ttnn/operations/reduction/accumulation/cumprod/cumprod.hpp"
+#include "ttnn/operations/reduction/accumulation/cumsum/cumsum.hpp"
+#include "ttnn/operations/reduction/argmax/argmax.hpp"
+#include "ttnn/operations/reduction/generic/generic_reductions.hpp"
+#include "ttnn/operations/reduction/prod/prod.hpp"
+#include "ttnn/operations/reduction/reduction_common/reduction_common.hpp"
+#include "ttnn/operations/reduction/sampling/sampling.hpp"
+#include "ttnn/operations/reduction/topk/topk.hpp"
+#include "ttnn/operations/transformer/concatenate_heads/concatenate_heads.hpp"
+#include "ttnn/operations/transformer/sdpa/sdpa.hpp"
+#include "ttnn/operations/transformer/sdpa_decode/sdpa_decode.hpp"
+#include "ttnn/operations/transformer/split_query_key_value_and_split_heads/split_query_key_value_and_split_heads.hpp"
+#include "ttnn/tensor/tensor.hpp"
+#include "ttnn/tensor/tensor_spec.hpp"
+#include "ttnn/tensor/types.hpp"
+
+#endif // TTMLIR_OPMODEL_TTNN_METALHEADERS_H

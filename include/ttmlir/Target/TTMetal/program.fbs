@@ -1,0 +1,120 @@
+include "ttmlir/Target/Common/types.fbs";
+include "ttmlir/Target/TTMetal/types.fbs";
+
+namespace tt.target.metal;
+
+enum EthType : ushort {
+  Sender,
+  Receiver,
+}
+
+table NocConfig {
+  processor: DataMovementProcessor;
+  noc_index: NocIndex;
+}
+
+table ComputeConfig {
+  math_fidelity: MathFidelity;
+  fp32_dest_acc_en: bool;
+  dst_full_sync_en: bool;
+  math_approx_mode: bool;
+  unpack_to_dest_mode: [UnpackToDestMode];
+}
+
+table EthernetConfig {
+  eth_type: EthType;
+  noc_index: NocIndex;
+}
+
+union KernelConfigType {
+  NocConfig,
+  ComputeConfig,
+  EthernetConfig,
+}
+
+table KernelSource {
+  source: string;
+}
+
+enum BinaryType : ushort {
+  BRISC,
+  NCRISC,
+  TRISC0,
+  TRISC1,
+  TRISC2,
+  ERISC,
+}
+
+enum CoreType : ushort {
+  WORKER,
+  ETH,
+}
+
+table KernelBinary {
+  core_type: BinaryType;
+  data: [ubyte];
+  debug_source: string;
+}
+
+union Kernel {
+  KernelSource,
+  KernelBinary,
+}
+
+table KernelArgCBPort {
+  operand_idx: uint32;
+}
+
+table KernelArgBufferAddress {
+  operand_idx: uint32;
+}
+
+table KernelArgLocalSemaphore {
+  operand_idx: uint32;
+}
+
+table KernelArgNamedArgument {
+  name: string;
+  value: uint32;
+}
+
+table KernelArgGlobalSemaphore {
+  operand_idx: uint32;
+}
+
+table KernelArgScalar {
+  operand_idx: uint32;
+}
+
+union KernelArgType {
+  KernelArgCBPort,
+  KernelArgBufferAddress,
+  KernelArgLocalSemaphore,
+  KernelArgNamedArgument,
+  KernelArgGlobalSemaphore,
+  KernelArgScalar,
+}
+
+table KernelArg {
+  arg: KernelArgType;
+}
+
+table KernelArgs {
+  crt_args: [KernelArg];
+  rt_args: [KernelArg];
+  ct_args: [KernelArg];
+}
+
+table KernelConfig {
+  kernel: Kernel;
+  core_range_set: [Dim2dRange];
+  args: KernelArgs;
+  type: KernelConfigType;
+  debug_info: string;
+  symbol: string;
+  loc: string;
+}
+
+table ProgramDesc {
+  kernels: [KernelConfig];
+}

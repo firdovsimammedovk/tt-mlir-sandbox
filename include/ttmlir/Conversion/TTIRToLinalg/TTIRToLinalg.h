@@ -1,0 +1,29 @@
+// SPDX-FileCopyrightText: (c) 2024 Tenstorrent AI ULC
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#ifndef TTMLIR_CONVERSION_TTIRTOLINALG_TTIRTOLINALG_H
+#define TTMLIR_CONVERSION_TTIRTOLINALG_TTIRTOLINALG_H
+
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Linalg/IR/LinalgInterfaces.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Pass/Pass.h"
+#include "mlir/Transforms/DialectConversion.h"
+
+namespace mlir::tt::ttir_to_linalg {
+
+void populateTTIRToLinalgPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
+                                  TypeConverter &typeConverter);
+void populateTTIRToTosaPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
+                                TypeConverter &typeConverter);
+
+} // namespace mlir::tt::ttir_to_linalg
+
+namespace mlir::tt {
+
+std::unique_ptr<OperationPass<ModuleOp>> createConvertTTIRToLinalgPass();
+
+} // namespace mlir::tt
+
+#endif // TTMLIR_CONVERSION_TTIRTOLINALG_TTIRTOLINALG_H

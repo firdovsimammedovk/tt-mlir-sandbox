@@ -1,0 +1,211 @@
+include "ttmlir/Target/Common/types.fbs";
+include "ttmlir/Target/TTNN/types.fbs";
+include "ttmlir/Target/TTNN/binary.fbs";
+include "tt/runtime/flatbuffer/types.fbs";
+
+namespace tt.runtime.distributed.flatbuffer;
+
+// Configures the runtime context on the worker.
+// Fabric config should be set to the default value for the worker and
+// explicitly set by the runtime API if desired (which has other side effects).
+// Host runtime should be Local for the worker.
+table ConfigureRuntimeContextCommand {
+  mlir_home: string;
+  metal_home: string;
+  current_device_runtime: tt.runtime.flatbuffer.DeviceRuntime;
+  memory_log_level: tt.runtime.flatbuffer.MemoryLogLevel;
+}
+
+table SetMemoryLogLevelCommand {
+  memory_log_level: tt.runtime.flatbuffer.MemoryLogLevel;
+}
+
+table GetSystemDescCommand {
+  device: tt.target.DeviceRef;
+  dispatch_core_type: tt.runtime.flatbuffer.DispatchCoreType = null;
+}
+
+table SetFabricConfigCommand {
+  config: tt.runtime.flatbuffer.FabricConfig;
+}
+
+table GetNumAvailableDevicesCommand {
+}
+
+table OpenMeshDeviceCommand {
+  device_global_id: uint32;
+  options: tt.runtime.flatbuffer.MeshDeviceOptions;
+}
+
+table CloseMeshDeviceCommand {
+  device: tt.target.DeviceRef;
+}
+
+table CreateSubMeshDeviceCommand {
+  parent_mesh: tt.target.DeviceRef;
+  submesh_global_id: uint32;
+  mesh_shape: [uint32];
+  mesh_offset: [uint32];
+}
+
+table ReleaseSubMeshDeviceCommand {
+  sub_mesh: tt.target.DeviceRef;
+}
+
+table GetMeshShapeCommand {
+  device: tt.target.DeviceRef;
+}
+
+table CreateHostTensorCommand {
+  output_global_id: uint64;
+  data: [ubyte];
+  shape: [uint32];
+  stride: [int64];
+  item_size: uint32;
+  data_type: tt.target.DataType;
+}
+
+table StrategyEntry {
+  key: string;
+  value: string;
+}
+
+table CreateMultiDeviceHostTensorFromShardsCommand {
+  input_global_ids: [uint64];
+  output_global_id: uint64;
+  strategy_map: [StrategyEntry];
+  mesh_shape: [uint32];
+}
+
+// Worker looks up `source_tensor_global_id` in the tensor pool and registers a
+// borrowed host tensor as `output_global_id`. No tensor bytes are sent.
+table CreateUnsafeBorrowedHostTensorCommand {
+  source_tensor_global_id: uint64;
+  output_global_id: uint64;
+}
+
+table IsTensorAllocatedCommand {
+  tensor_global_id: uint64;
+}
+
+table GetTensorVolumeCommand {
+  tensor_global_id: uint64;
+}
+
+table GetTensorRetainCommand {
+  tensor_global_id: uint64;
+}
+
+table SetTensorRetainCommand {
+  tensor_global_id: uint64;
+  retain: bool;
+}
+
+table GetLayoutCommand {
+  binary_id: uint64;
+  binary: [ubyte]; // raw bytes of size-prefixed TTNNBinary
+  program_id: uint32;
+  input_id: uint32;
+  output_layout_id: uint64;
+}
+
+table ToLayoutCommand {
+  input_global_id: uint64;
+  output_global_id: uint64;
+  device: tt.target.DeviceRef;
+  layout_global_id: uint64;
+  retain: bool = null;
+}
+
+table SubmitCommand {
+  input_global_ids: [uint64];
+  output_global_ids: [uint64];
+  binary_id: uint64;
+  binary: [ubyte]; // raw bytes of size-prefixed TTNNBinary
+  program_id: uint32;
+  device: tt.target.DeviceRef;
+}
+
+
+table GetNumShardsCommand {
+  input_global_id: uint64;
+}
+
+table ToHostCommand {
+  input_global_id: uint64;
+  output_global_ids: [uint64];
+  untilize: bool;
+  blocking: bool;
+}
+
+table MemcpyCommand {
+  src_global_id: uint64;
+  dst_global_id: uint64 = null; // If null, will send raw data to the controller in the response
+  dst_data_type: tt.target.DataType = null;
+}
+
+table DeallocateTensorCommand {
+  tensor_global_id: uint64;
+  force: bool;
+}
+
+table ShutdownCommand {
+}
+
+table GetTensorDescCommand{
+  tensor_global_id: uint64;
+}
+
+table HasLayoutCommand{
+  tensor_global_id: uint64;
+  layout_global_id: uint64;
+}
+
+table IsProgramCacheEnabledCommand{
+  device: tt.target.DeviceRef;
+}
+
+table ClearProgramCacheCommand{
+  device: tt.target.DeviceRef;
+}
+
+union CommandType {
+  ConfigureRuntimeContextCommand,
+  SetMemoryLogLevelCommand,
+  GetSystemDescCommand,
+  SetFabricConfigCommand,
+  GetNumAvailableDevicesCommand,
+  OpenMeshDeviceCommand,
+  CloseMeshDeviceCommand,
+  CreateSubMeshDeviceCommand,
+  ReleaseSubMeshDeviceCommand,
+  GetMeshShapeCommand,
+  CreateHostTensorCommand,
+  CreateMultiDeviceHostTensorFromShardsCommand,
+  IsTensorAllocatedCommand,
+  GetTensorVolumeCommand,
+  GetTensorRetainCommand,
+  SetTensorRetainCommand,
+  GetLayoutCommand,
+  ToLayoutCommand,
+  SubmitCommand,
+  GetNumShardsCommand,
+  ToHostCommand,
+  MemcpyCommand,
+  DeallocateTensorCommand,
+  ShutdownCommand,
+  GetTensorDescCommand,
+  HasLayoutCommand,
+  IsProgramCacheEnabledCommand,
+  ClearProgramCacheCommand,
+  CreateUnsafeBorrowedHostTensorCommand,
+}
+
+table Command {
+  command_id: uint64;
+  type: CommandType;
+}
+
+root_type Command;
+file_identifier "DCMD";
+file_extension "distcmd";

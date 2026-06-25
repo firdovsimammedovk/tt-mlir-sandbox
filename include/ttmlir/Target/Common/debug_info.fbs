@@ -1,0 +1,32 @@
+include "ttmlir/Target/Common/types.fbs";
+
+namespace tt.target;
+
+table GoldenTensor {
+  name: string;
+  shape: [int64];
+  stride: [int64];
+  dtype: tt.target.DataType;
+  data: [uint8];
+}
+
+table GoldenDeviceTensor {
+  device: uint32;
+  value: GoldenTensor;
+}
+
+table GoldenKV {
+  key: string;
+  value: [GoldenDeviceTensor];
+}
+
+table GoldenInfo {
+  golden_map: [GoldenKV];
+}
+
+
+table DebugInfo {
+  cpp: string;
+  mlir_stages: [MLIR];
+  golden_info: GoldenInfo;
+}

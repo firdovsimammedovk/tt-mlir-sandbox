@@ -1,0 +1,18 @@
+// TODO(dmilinkovic): re-enable CPU-hoisted const-eval once EmitC support for CPU-hoisted ops lands - issue #6100.
+// RUN: ttmlir-opt --ttir-to-ttnn-common-pipeline="enable-cpu-hoisted-const-eval=false system-desc-path=%system_desc_path%" -o %t.mlir %s
+//
+// RUN: ttmlir-opt --ttnn-common-to-runtime-pipeline -o %t_rt.mlir %t.mlir
+// RUN: ttmlir-translate --ttnn-to-flatbuffer -o %basename_t.ttnn %t_rt.mlir
+//
+// RUN: ttmlir-opt --ttnn-common-to-emitc-pipeline -o %t2.mlir %t.mlir
+// RUN: ttmlir-translate --mlir-to-cpp -o %basename_t.cpp %t2.mlir
+
+func.func @softmax(%arg0: tensor<512x1024xbf16>) -> tensor<512x1024xbf16> {
+  %0 = "ttir.softmax"(%arg0) <{dimension = 1 : si32, numericStable = false}> : (tensor<512x1024xbf16>) -> tensor<512x1024xbf16>
+  return %0 : tensor<512x1024xbf16>
+}
+
+func.func @softmax_numeric_stable(%arg0: tensor<512x1024xbf16>) -> tensor<512x1024xbf16> {
+  %0 = "ttir.softmax"(%arg0) <{dimension = 1 : si32, numericStable = true}> : (tensor<512x1024xbf16>) -> tensor<512x1024xbf16>
+  return %0 : tensor<512x1024xbf16>
+}

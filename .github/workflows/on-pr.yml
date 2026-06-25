@@ -1,0 +1,146 @@
+name: On PR
+
+on:
+  workflow_dispatch:
+    inputs:
+      metal_override:
+        description: 'Git SHA of commit in tenstorrent/tt-metal'
+        required: false
+        type: string
+      builder_build:
+        description: 'Run build on builder'
+        required: false
+        type: boolean
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [ "main" ]
+
+permissions:
+  checks: write
+  packages: write
+  pull-requests: write
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pre-commit:
+    uses: ./.github/workflows/call-pre-commit.yml
+    secrets: inherit
+  build-image:
+    uses: ./.github/workflows/call-build-docker.yml
+    secrets: inherit
+  prepare-run:
+    uses: ./.github/workflows/call-prepare-run.yml
+    with:
+      builder_build: true
+      build_all: ${{ github.event.pull_request.head.ref == 'uplift' || contains(github.event.pull_request.labels.*.name, 'build_all') || contains(github.event.pull_request.labels.*.name, 'uplift') }}
+      min_timeout: ${{ (contains(github.event.pull_request.labels.*.name, 'build_all') || contains(github.event.pull_request.labels.*.name, 'uplift')) && 180 || 40 }}
+    secrets: inherit
+  release-build:
+    needs: [ prepare-run, build-image ]
+    if: needs.prepare-run.outputs.skip_build != 'true'
+    uses: ./.github/workflows/call-build-release.yml
+    secrets: inherit
+    with:
+      metal_override: ${{ inputs.metal_override }}
+      docker_image: ${{ needs.build-image.outputs.docker-image }}
+      runner: ${{ needs.prepare-run.outputs.runner }}
+      sh_builder: ${{ fromJson(needs.prepare-run.outputs.sh_builder) }}
+      component_matrix: ${{ needs.prepare-run.outputs.build_matrix }}
+  debug-build:
+    needs: [ prepare-run, build-image ]
+    if: needs.prepare-run.outputs.skip_build != 'true'
+    uses: ./.github/workflows/call-build-debug.yml
+    secrets: inherit
+    with:
+      docker-image: ${{ needs.build-image.outputs.docker-image }}
+  lint:
+    needs: [ prepare-run, build-image ]
+    if: needs.prepare-run.outputs.skip_build != 'true'
+    uses: ./.github/workflows/call-lint.yml
+    secrets: inherit
+    with:
+      docker-image: ${{ needs.build-image.outputs.docker-image }}
+  test:
+    needs: [ pre-commit, prepare-run, build-image, release-build ]
+    if: needs.prepare-run.outputs.skip_build != 'true'
+    uses: ./.github/workflows/call-test.yml
+    secrets: inherit
+    with:
+      docker_image: ${{ needs.build-image.outputs.docker-image }}
+      test_matrix: ${{ needs.prepare-run.outputs.test_matrix }}
+      timeout: ${{ fromJson(needs.prepare-run.outputs.test_timeout) }}
+  ttsim-test:
+    needs: [ prepare-run, build-image, release-build ]
+    if: needs.prepare-run.outputs.skip_build != 'true'
+    uses: ./.github/workflows/call-test-ttsim.yml
+    secrets: inherit
+    with:
+      docker_image: ${{ needs.build-image.outputs.docker-image }}
+
+  # When a PR runs on the uplift branch trigger the downstream checks
+  downstream-checks:
+    runs-on: ubuntu-latest
+    needs: [ release-build, debug-build, test ]
+    if: github.event.pull_request.head.ref == 'uplift'
+    strategy:
+      matrix:
+        projects: [
+          { name: "tenstorrent/tt-forge-onnx", workflow-name: "on-pr.yml" },
+          { name: "tenstorrent/tt-xla", workflow-name: "manual-test.yml" },
+          { name: "tenstorrent/tt-xla", workflow-name: "manual-benchmark.yml" },
+          { name: "tenstorrent/tt-xla", workflow-name: "manual-test-tools.yml" }
+        ]
+    env:
+      GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+      TARGET_REPO: ${{ matrix.projects.name }}
+      WORKFLOW_NAME: ${{ matrix.projects.workflow-name }}
+    steps:
+      - name: Trigger ${{ env.TARGET_REPO }} tests
+        shell: bash
+        run: |
+          if [[ "${{ env.TARGET_REPO }}" == "tenstorrent/tt-xla" && "${{ env.WORKFLOW_NAME }}" == "manual-test.yml" ]]; then
+            gh workflow run ${{ env.WORKFLOW_NAME }} \
+              --repo ${{ env.TARGET_REPO }} --ref main \
+              --raw-field mlir_override=${{ github.event.pull_request.head.sha }} \
+              --raw-field test_suite=full-mlir-uplift-qualification.json
+
+          elif [[ "${{ env.TARGET_REPO }}" == "tenstorrent/tt-xla" && "${{ env.WORKFLOW_NAME }}" == "manual-benchmark.yml" ]]; then
+            # Perf benchmark in tt-xla/tt-forge against uplifted tt-mlir + tt-metal
+            gh workflow run ${{ env.WORKFLOW_NAME }} \
+              --repo ${{ env.TARGET_REPO }} --ref main \
+              --raw-field mlir_override=${{ github.event.pull_request.head.sha }} \
+              --raw-field sh-runner=false
+
+          else
+            gh workflow run ${{ env.WORKFLOW_NAME }} \
+              --repo ${{ env.TARGET_REPO }} --ref main \
+              --raw-field mlir_override=${{ github.event.pull_request.head.sha }}
+          fi
+          gh run list --workflow=${{ env.WORKFLOW_NAME }} --repo ${{ env.TARGET_REPO }} --branch main --limit 1
+          echo "Triggered ${{ env.TARGET_REPO }} with tt-mlir ${{ github.event.pull_request.head.sha }}"
+          echo "### Triggered [${{ env.TARGET_REPO }}](https://github.com/${{ env.TARGET_REPO }}/actions/workflows/${{ env.WORKFLOW_NAME }}) with tt-mlir ${{ github.event.pull_request.head.sha }} :rocket:" >> $GITHUB_STEP_SUMMARY
+
+  check-all-green:
+    if: always()
+    needs:
+      - pre-commit
+      - prepare-run
+      - build-image
+      - release-build
+      - test
+      - ttsim-test
+      - debug-build
+      - lint
+      - downstream-checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check if the needed jobs succeeded or failed
+        id: check-jobs
+        uses: re-actors/alls-green@release/v1
+        with:
+          allowed-skips: debug-build, lint, release-build, test, downstream-checks, ttsim-test
+          jobs: ${{ toJSON(needs) }}

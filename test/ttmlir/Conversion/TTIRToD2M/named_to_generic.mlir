@@ -1,0 +1,593 @@
+// RUN: ttmlir-opt --ttcore-register-device --ttir-to-d2m --d2m-materialize-view-returns -o %t %s
+// RUN: FileCheck %s --input-file=%t
+
+!ttype = tensor<128x96xf32>
+!ttype_col = tensor<128x1xf32>
+!ttype_row = tensor<1x96xf32>
+!ttype_scalar = tensor<1x1xf32>
+
+!lhs = tensor<128x96xf32>
+!rhs = tensor<96x64xf32>
+!matmul_result = tensor<128x64xf32>
+
+module {
+
+  // CHECK-LABEL: func @named_elementwise
+  func.func @named_elementwise(%lhs: !ttype, %rhs: !ttype, %out: !ttype) -> (!ttype) {
+    // named elementwise op, binary:
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "parallel"]
+    // CHECK: "d2m.tile_add"(%{{.*}}, %{{.*}})
+    %0 = "ttir.add"(%lhs, %rhs) : (!ttype, !ttype) -> !ttype
+    // named elementwise op, unary:
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "parallel"]
+    // CHECK: d2m.tile_exp
+    %1 = "ttir.exp"(%0) : (!ttype) -> !ttype
+    // named elementwise op, binary:
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "parallel"]
+    // CHECK: "d2m.tile_mul"(%{{.*}}, %{{.*}})
+    %2 = "ttir.multiply"(%0, %1) : (!ttype, !ttype) -> !ttype
+    // named elementwise op, unary:
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "parallel"]
+    // CHECK: d2m.tile_log
+    %3 = "ttir.log"(%2) : (!ttype) -> !ttype
+    // named elementwise op, binary:
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "parallel"]
+    // CHECK: d2m.tile_maximum
+    %4 = "ttir.maximum"(%2, %3) : (!ttype, !ttype) -> !ttype
+    // named elementwise op, unary:
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "parallel"]
+    // CHECK: d2m.tile_sin
+    %5 = "ttir.sin"(%4) : (!ttype) -> !ttype
+    // named elementwise op, binary:
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "parallel"]
+    // CHECK: "d2m.tile_sub"(%{{.*}}, %{{.*}})
+    %6 = "ttir.subtract"(%4, %5) : (!ttype, !ttype) -> !ttype
+    // named elementwise op, unary:
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "parallel"]
+    // CHECK: d2m.tile_ceil
+    %7 = "ttir.ceil"(%6) : (!ttype) -> !ttype
+    // named elementwise op, unary:
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "parallel"]
+    // CHECK: d2m.tile_rsqrt
+    %8 = "ttir.rsqrt"(%7) : (!ttype) -> !ttype
+    // named elementwise op, binary:
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "parallel"]
+    // CHECK: d2m.tile_pow
+    %9 = "ttir.pow"(%7, %8) : (!ttype, !ttype) -> !ttype
+    // named elementwise op, unary:
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "parallel"]
+    // CHECK: d2m.tile_negative
+    %10 = "ttir.neg"(%9) : (!ttype) -> !ttype
+    // named elementwise op, unary:
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "parallel"]
+    // CHECK: d2m.tile_cos
+    %11 = "ttir.cos"(%10) : (!ttype) -> !ttype
+    // named elementwise op, unary:
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "parallel"]
+    // CHECK: d2m.tile_tan
+    %12 = "ttir.tan"(%11) : (!ttype) -> !ttype
+    // named elementwise op, binary:
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "parallel"]
+    // CHECK: d2m.tile_div
+    %13 = "ttir.div"(%11, %12) : (!ttype, !ttype) -> !ttype
+    // named elementwise op, unary:
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "parallel"]
+    // CHECK: d2m.tile_abs
+    %14 = "ttir.abs"(%13) : (!ttype) -> !ttype
+    // named elementwise op, unary:
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "parallel"]
+    // CHECK: d2m.tile_sqrt
+    %15 = "ttir.sqrt"(%14) : (!ttype) -> !ttype
+    // named elementwise op, unary:
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "parallel"]
+    // CHECK: d2m.tile_recip
+    %16 = "ttir.reciprocal"(%15) : (!ttype) -> !ttype
+    // named elementwise op, unary:
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "parallel"]
+    // CHECK: d2m.tile_floor
+    %17 = "ttir.floor"(%16) : (!ttype) -> !ttype
+    // named elementwise op, unary:
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "parallel"]
+    // CHECK: d2m.tile_logical_not
+    %18 = "ttir.logical_not"(%17) : (!ttype) -> !ttype
+    // named elementwise op, binary comparison:
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "parallel"]
+    // CHECK: "d2m.tile_eq"(%{{.*}}, %{{.*}})
+    %19 = "ttir.eq"(%lhs, %rhs) : (!ttype, !ttype) -> !ttype
+    // named elementwise op, binary comparison:
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "parallel"]
+    // CHECK: "d2m.tile_ne"(%{{.*}}, %{{.*}})
+    %20 = "ttir.ne"(%lhs, %rhs) : (!ttype, !ttype) -> !ttype
+    // named elementwise op, binary comparison:
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "parallel"]
+    // CHECK: "d2m.tile_lt"(%{{.*}}, %{{.*}})
+    %21 = "ttir.lt"(%lhs, %rhs) : (!ttype, !ttype) -> !ttype
+    // named elementwise op, binary comparison:
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "parallel"]
+    // CHECK: "d2m.tile_le"(%{{.*}}, %{{.*}})
+    %22 = "ttir.le"(%lhs, %rhs) : (!ttype, !ttype) -> !ttype
+    // named elementwise op, binary comparison:
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "parallel"]
+    // CHECK: "d2m.tile_gt"(%{{.*}}, %{{.*}})
+    %23 = "ttir.gt"(%lhs, %rhs) : (!ttype, !ttype) -> !ttype
+    // named elementwise op, binary comparison:
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "parallel"]
+    // CHECK: "d2m.tile_ge"(%{{.*}}, %{{.*}})
+    %24 = "ttir.ge"(%lhs, %rhs) : (!ttype, !ttype) -> !ttype
+    // named elementwise op, unary:
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "parallel"]
+    // CHECK: d2m.tile_gelu
+    %25 = "ttir.gelu"(%24) : (!ttype) -> !ttype
+    // named elementwise op, unary:
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "parallel"]
+    // CHECK: d2m.tile_erf
+    %26 = "ttir.erf"(%25) : (!ttype) -> !ttype
+    // named elementwise op, unary:
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "parallel"]
+    // CHECK: d2m.tile_erfc
+    %27 = "ttir.erfc"(%26) : (!ttype) -> !ttype
+    // named elementwise op, unary:
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "parallel"]
+    // CHECK: d2m.tile_sign
+    %28 = "ttir.sign"(%27) : (!ttype) -> !ttype
+    // named elementwise op, unary:
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "parallel"]
+    // CHECK: d2m.tile_bitwise_not
+    %29 = "ttir.bitwise_not"(%28) : (!ttype) -> !ttype
+    // named elementwise op, unary:
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "parallel"]
+    // CHECK: d2m.tile_silu
+    %30 = "ttir.silu"(%29) : (!ttype) -> !ttype
+    // named elementwise op, unary:
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "parallel"]
+    // CHECK: d2m.tile_relu
+    %31= "ttir.relu"(%30) : (!ttype) -> !ttype
+    // named elementwise op, bitwise_and:
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "parallel"]
+    // CHECK: d2m.tile_bitwise_and
+    %32 = "ttir.bitwise_and"(%26, %27) : (!ttype, !ttype) -> !ttype
+    // named elementwise op, bitwise_or:
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "parallel"]
+    // CHECK: d2m.tile_bitwise_or
+    %33 = "ttir.bitwise_or"(%26, %27) : (!ttype, !ttype) -> !ttype
+    // named elementwise op, bitwise_xor:
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "parallel"]
+    // CHECK: d2m.tile_bitwise_xor
+    %34 = "ttir.bitwise_xor"(%26, %27) : (!ttype, !ttype) -> !ttype
+    // named elementwise op, unary:
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "parallel"]
+    // CHECK: d2m.tile_tanh
+    %35 = "ttir.tanh"(%34) : (!ttype) -> !ttype
+    // named elementwise op, unary:
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "parallel"]
+    // CHECK: d2m.tile_sigmoid
+    %36 = "ttir.sigmoid"(%35) : (!ttype) -> !ttype
+    // named elementwise op, unary:
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "parallel"]
+    // CHECK: d2m.tile_hardsigmoid
+    %37 = "ttir.hardsigmoid"(%36) : (!ttype) -> !ttype
+    // named elementwise op, binary:
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "parallel"]
+    // CHECK: d2m.tile_minimum
+    %38 = "ttir.minimum"(%37, %36) : (!ttype, !ttype) -> !ttype
+    // named elementwise op, unary:
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "parallel"]
+    // CHECK: d2m.tile_exp2
+    %39 = "ttir.exp2"(%38) : (!ttype) -> !ttype
+    // named elementwise op, unary:
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "parallel"]
+    // CHECK: d2m.tile_expm1
+    %40 = "ttir.expm1"(%39) : (!ttype) -> !ttype
+    // named elementwise op, unary:
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "parallel"]
+    // CHECK: d2m.tile_log1p
+    %41 = "ttir.log1p"(%40) : (!ttype) -> !ttype
+    // named elementwise op, unary:
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "parallel"]
+    // CHECK: d2m.tile_softsign
+    %42 = "ttir.softsign"(%41) : (!ttype) -> !ttype
+    // named elementwise op, unary:
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "parallel"]
+    // CHECK: d2m.tile_signbit
+    %43 = "ttir.signbit"(%42) : (!ttype) -> !ttype
+    // named elementwise op, unary:
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "parallel"]
+    // CHECK: d2m.tile_selu
+    %44 = "ttir.selu"(%43) : (!ttype) -> !ttype
+    // named elementwise op, unary:
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "parallel"]
+    // CHECK: d2m.tile_frac
+    %45 = "ttir.frac"(%44) : (!ttype) -> !ttype
+    // named elementwise op, unary:
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "parallel"]
+    // CHECK: d2m.tile_trunc
+    %46 = "ttir.trunc"(%45) : (!ttype) -> !ttype
+    // named elementwise op, unary:
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "parallel"]
+    // CHECK: d2m.tile_square
+    %47 = "ttir.square"(%46) : (!ttype) -> !ttype
+    // named elementwise op, binary:
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "parallel"]
+    // CHECK: d2m.tile_atan2
+    %48 = "ttir.atan2"(%47, %47) : (!ttype, !ttype) -> !ttype
+    return %48: !ttype
+  }
+
+  // CHECK-LABEL: func @named_reductions_R
+  func.func @named_reductions_R(%arg: !ttype) -> (tensor<1x96xf32>) {
+    // CHECK: d2m.tile_fill
+    // CHECK: d2m.generic{{.+}}iterator_types = [#reduction, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["reduction", "parallel"]
+    // CHECK: d2m.tile_reduce_sum{{.+}}d2m<reduce_dim C>
+    %1 = "ttir.sum"(%arg) <{dim_arg = [-2: i32], keep_dim = true}> : (!ttype) -> tensor<1x96xf32>
+    return %1: tensor<1x96xf32>
+  }
+
+  // CHECK-LABEL: func @named_reductions_C
+  func.func @named_reductions_C(%arg: !ttype) -> (tensor<128x1xf32>) {
+    // CHECK: d2m.tile_fill
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #reduction]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "reduction"]
+    // CHECK: d2m.tile_reduce_sum{{.+}}d2m<reduce_dim R>
+    %1 = "ttir.sum"(%arg) <{dim_arg = [-1: i32], keep_dim = true}> : (!ttype) -> tensor<128x1xf32>
+    return %1 : tensor<128x1xf32>
+  }
+
+  // CHECK-LABEL: func @named_reductions_RC
+  func.func @named_reductions_RC(%arg: !ttype) -> (tensor<1x1xf32>) {
+    // CHECK: d2m.tile_fill
+    // CHECK: d2m.generic{{.+}}iterator_types = [#reduction, #reduction]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["reduction", "reduction"]
+    // CHECK: d2m.tile_reduce_sum{{.+}}d2m<reduce_dim RC>
+    %1 = "ttir.sum"(%arg) <{dim_arg = [-2: i32, -1: i32], keep_dim = true}> : (!ttype) -> tensor<1x1xf32>
+    return %1: tensor<1x1xf32>
+  }
+
+  // CHECK-LABEL: func @named_mean_reductions_R
+  func.func @named_mean_reductions_R(%arg: !ttype) -> (tensor<1x96xf32>) {
+    // CHECK: d2m.tile_fill
+    // CHECK: d2m.generic{{.+}}iterator_types = [#reduction, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["reduction", "parallel"]
+    // CHECK: d2m.tile_reduce_mean{{.+}}d2m<reduce_dim C>
+    %1 = "ttir.mean"(%arg) <{dim_arg = [-2: i32], keep_dim = true}> : (!ttype) -> tensor<1x96xf32>
+    return %1: tensor<1x96xf32>
+  }
+
+  // CHECK-LABEL: func @named_mean_reductions_C
+  func.func @named_mean_reductions_C(%arg: !ttype) -> (tensor<128x1xf32>) {
+    // CHECK: d2m.tile_fill
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #reduction]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "reduction"]
+    // CHECK: d2m.tile_reduce_mean{{.+}}d2m<reduce_dim R>
+    %1 = "ttir.mean"(%arg) <{dim_arg = [-1: i32], keep_dim = true}> : (!ttype) -> tensor<128x1xf32>
+    return %1 : tensor<128x1xf32>
+  }
+
+  // CHECK-LABEL: func @named_mean_reductions_RC
+  func.func @named_mean_reductions_RC(%arg: !ttype) -> (tensor<1x1xf32>) {
+    // CHECK: d2m.tile_fill
+    // CHECK: d2m.generic{{.+}}iterator_types = [#reduction, #reduction]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["reduction", "reduction"]
+    // CHECK: d2m.tile_reduce_mean{{.+}}d2m<reduce_dim RC>
+    %1 = "ttir.mean"(%arg) <{dim_arg = [-2: i32, -1: i32], keep_dim = true}> : (!ttype) -> tensor<1x1xf32>
+    return %1: tensor<1x1xf32>
+  }
+
+  // Min is decomposed into neg -> max -> neg (no hardware reduce_min).
+  // CHECK-LABEL: func @named_min_reduction_R
+  func.func @named_min_reduction_R(%arg: !ttype) -> (tensor<1x96xf32>) {
+    // CHECK: d2m.tile_negative
+    // CHECK: d2m.tile_fill
+    // CHECK: d2m.generic{{.+}}iterator_types = [#reduction, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["reduction", "parallel"]
+    // CHECK: d2m.tile_reduce_max{{.+}}d2m<reduce_dim C>
+    // CHECK: d2m.tile_negative
+    %1 = "ttir.min"(%arg) <{dim_arg = [-2: i32], keep_dim = true}> : (!ttype) -> tensor<1x96xf32>
+    return %1: tensor<1x96xf32>
+  }
+
+  // CHECK-LABEL: func @named_min_reduction_C
+  func.func @named_min_reduction_C(%arg: !ttype) -> (tensor<128x1xf32>) {
+    // CHECK: d2m.tile_negative
+    // CHECK: d2m.tile_fill
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #reduction]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "reduction"]
+    // CHECK: d2m.tile_reduce_max{{.+}}d2m<reduce_dim R>
+    // CHECK: d2m.tile_negative
+    %1 = "ttir.min"(%arg) <{dim_arg = [-1: i32], keep_dim = true}> : (!ttype) -> tensor<128x1xf32>
+    return %1 : tensor<128x1xf32>
+  }
+
+  // CHECK-LABEL: func @named_min_reduction_RC
+  func.func @named_min_reduction_RC(%arg: !ttype) -> (tensor<1x1xf32>) {
+    // CHECK: d2m.tile_negative
+    // CHECK: d2m.tile_fill
+    // CHECK: d2m.generic{{.+}}iterator_types = [#reduction, #reduction]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["reduction", "reduction"]
+    // CHECK: d2m.tile_reduce_max{{.+}}d2m<reduce_dim RC>
+    // CHECK: d2m.tile_negative
+    %1 = "ttir.min"(%arg) <{dim_arg = [-2: i32, -1: i32], keep_dim = true}> : (!ttype) -> tensor<1x1xf32>
+    return %1: tensor<1x1xf32>
+  }
+
+  // CHECK-LABEL: func @named_contractions
+  func.func @named_contractions(%lhs: !lhs, %rhs: !rhs) -> (!matmul_result) {
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel, #reduction]
+    // CHECK: linalg.generic
+    // CHECK: d2m.tile_matmul
+    %r = "ttir.matmul"(%lhs, %rhs) : (!lhs, !rhs) -> (!matmul_result)
+    return %r : !matmul_result
+  }
+
+  // CHECK-LABEL: func @implicit_bcast_2d_dual
+  func.func @implicit_bcast_2d_dual(%in0: !ttype_col, %in1: !ttype_row) -> (!ttype) {
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic
+    // CHECK: "d2m.tile_bcast"(%{{.*}}) <{bcast_type = #d2m<tile_bcast_type col>}>
+    // CHECK: "d2m.tile_bcast"(%{{.*}}) <{bcast_type = #d2m<tile_bcast_type row>}>
+    // CHECK: d2m.tile_add
+    %0 = "ttir.add"(%in0, %in1) : (!ttype_col, !ttype_row) -> (!ttype)
+    return %0 : !ttype
+  }
+
+  // CHECK-LABEL: func @implicit_bcast_2d_scalar
+  func.func @implicit_bcast_2d_scalar(%in0: !ttype, %in1: !ttype_scalar) -> (!ttype) {
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic
+    // CHECK: "d2m.tile_bcast"(%{{.*}}) <{bcast_type = #d2m<tile_bcast_type scalar>}>
+    // CHECK: d2m.tile_add
+    %0 = "ttir.add"(%in0, %in1) : (!ttype, !ttype_scalar) -> (!ttype)
+    return %0 : !ttype
+  }
+
+  // CHECK-LABEL: func @named_ternary_where
+  func.func @named_ternary_where(%cond: !ttype, %true_val: !ttype, %false_val: !ttype) -> (!ttype) {
+    // named ternary op, where:
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "parallel"]
+    // CHECK: d2m.tile_where
+    %0 = "ttir.where"(%cond, %true_val, %false_val) : (!ttype, !ttype, !ttype) -> !ttype
+    return %0 : !ttype
+  }
+
+  // CHECK-LABEL: func @named_slice_static
+  func.func @named_slice_static(%arg0: tensor<96x96xf32>) -> tensor<32x32xf32> {
+    // CHECK-NOT: slice
+    // CHECK: %[[DEVICE_TENSOR:.*]] = d2m.to_layout %arg0
+    // CHECK: d2m.view_layout %[[DEVICE_TENSOR]]
+    // CHECK: d2m.generic
+    %0 = "ttir.slice_static"(%arg0) <{begins = [16 : i32, 0 : i32], ends = [48 : i32, 32 : i32], step = [1 : i32, 1 : i32]}> : (tensor<96x96xf32>) -> tensor<32x32xf32>
+    return %0 : tensor<32x32xf32>
+  }
+
+  // CHECK-LABEL: func @named_slice_static_w_unaligned
+  func.func @named_slice_static_w_unaligned(%arg0: tensor<96x96xf32>) -> tensor<32x32xf32> {
+    // Use the transpose-slice-transpose strategy.
+    // CHECK-NOT: slice
+    // CHECK: d2m.view_layout
+    // CHECK: d2m.generic
+    // CHECK: d2m.view_layout
+    // CHECK: d2m.view_layout
+    // CHECK: d2m.generic
+    %0 = "ttir.slice_static"(%arg0) <{begins = [32 : i32, 1 : i32], ends = [64 : i32, 64 : i32], step = [1 : i32, 2 : i32]}> : (tensor<96x96xf32>) -> tensor<32x32xf32>
+    return %0 : tensor<32x32xf32>
+  }
+
+  // CHECK-LABEL: func @named_slice_static_hw_unaligned
+  func.func @named_slice_static_hw_unaligned(%arg0: tensor<96x96xf32>) -> tensor<32x32xf32> {
+    // Use the slice-transpose-slice-transpose strategy.
+    // CHECK-NOT: slice
+    // CHECK: d2m.view_layout
+    // CHECK: d2m.view_layout
+    // CHECK: d2m.generic
+    // CHECK: d2m.view_layout
+    // CHECK: d2m.view_layout
+    // CHECK: d2m.generic
+    %0 = "ttir.slice_static"(%arg0) <{begins = [1 : i32, 0 : i32], ends = [96 : i32, 64 : i32], step = [3 : i32, 2 : i32]}> : (tensor<96x96xf32>) -> tensor<32x32xf32>
+    return %0 : tensor<32x32xf32>
+  }
+
+  // CHECK-LABEL: func @named_concat_tiled
+  func.func @named_concat_tiled(%arg0: tensor<32x32xf32>, %arg1: tensor<32x32xf32>) -> tensor<32x64xf32> {
+    // CHECK-NOT: concat
+    // CHECK-NOT: transpose
+    // CHECK-NOT: logicalSizes
+    // CHECK: "d2m.composite_view"{{.+}} -> tensor<1x1x1x2x!ttcore.tile<32x32, f32>
+    // CHECK: d2m.generic
+    // CHECK: d2m.remote_load
+    // CHECK: d2m.remote_store
+    %0 = "ttir.concat"(%arg0, %arg1) <{dim = -1 : si32}> : (tensor<32x32xf32>, tensor<32x32xf32>) -> tensor<32x64xf32>
+    return %0 : tensor<32x64xf32>
+  }
+
+  // CHECK-LABEL: func @named_concat_row_major
+  func.func @named_concat_row_major(%arg0: tensor<64x8xf32>, %arg1: tensor<64x8xf32>) -> tensor<64x16xf32> {
+    // CHECK-NOT: concat
+    // CHECK-NOT: transpose
+    // CHECK: "d2m.composite_view"{{.+}} logicalSizes {{.+}} -> tensor<1x1x64x32xf32
+    // CHECK: d2m.generic
+    // CHECK: d2m.remote_load
+    // CHECK: d2m.remote_store
+    %0 = "ttir.concat"(%arg0, %arg1) <{dim = 1 : si32}> : (tensor<64x8xf32>, tensor<64x8xf32>) -> tensor<64x16xf32>
+    return %0 : tensor<64x16xf32>
+  }
+
+  // CHECK-LABEL: func @named_concat_row_major_transposed
+  func.func @named_concat_row_major_transposed(%arg0: tensor<128x1xf32>, %arg1: tensor<128x2xf32>) -> tensor<128x3xf32> {
+    // CHECK-NOT: concat
+    // CHECK: d2m.generic
+    // CHECK: d2m.tile_transpose
+    // CHECK: d2m.generic
+    // CHECK: d2m.tile_transpose
+    // CHECK: "d2m.composite_view"{{.+}} logicalSizes {{.+}} -> tensor<1x1x32x128xf32
+    // CHECK: d2m.generic
+    // CHECK: d2m.remote_load
+    // CHECK: d2m.remote_store
+    // CHECK: d2m.generic
+    // CHECK: d2m.tile_transpose
+    %0 = "ttir.concat"(%arg0, %arg1) <{dim = 1 : si32}> : (tensor<128x1xf32>, tensor<128x2xf32>) -> tensor<128x3xf32>
+    return %0 : tensor<128x3xf32>
+  }
+
+  // CHECK-LABEL: func @named_clamp_scalar
+  func.func @named_clamp_scalar(%arg: !ttype) -> (!ttype) {
+    // named clamp_scalar op, unary with scalar attributes:
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "parallel"]
+    // CHECK: d2m.tile_clamp_scalar
+    %0 = "ttir.clamp_scalar"(%arg) <{min = 2.000000e+00 : f32, max = 5.000000e+00 : f32}> : (!ttype) -> !ttype
+    return %0 : !ttype
+  }
+
+  // CHECK-LABEL: func @named_clamp_tensor
+  func.func @named_clamp_tensor(%input: !ttype, %min: !ttype, %max: !ttype) -> (!ttype) {
+    // named clamp_tensor op, ternary:
+    // clamp_tensor is decomposed into maximum(input, min) then minimum(result, max)
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "parallel"]
+    // CHECK: d2m.tile_maximum
+    // CHECK: d2m.tile_minimum
+    %0 = "ttir.clamp_tensor"(%input, %min, %max) : (!ttype, !ttype, !ttype) -> !ttype
+    return %0 : !ttype
+  }
+
+  // CHECK-LABEL: func @named_logical_and
+  func.func @named_logical_and(%lhs: !ttype, %rhs: !ttype) -> (!ttype) {
+    // logical_and is decomposed into: NEZ(a) * NEZ(b) - both must be non-zero
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "parallel"]
+    // CHECK: d2m.tile_nez
+    // CHECK: d2m.tile_nez
+    // CHECK: "d2m.tile_mul"
+    %0 = "ttir.logical_and"(%lhs, %rhs) : (!ttype, !ttype) -> !ttype
+    return %0 : !ttype
+  }
+
+  // CHECK-LABEL: func @named_logical_or
+  func.func @named_logical_or(%lhs: !ttype, %rhs: !ttype) -> (!ttype) {
+    // logical_or is decomposed into: NEZ(NEZ(a) + NEZ(b)) - at least one must be non-zero
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "parallel"]
+    // CHECK: d2m.tile_nez
+    // CHECK: d2m.tile_nez
+    // CHECK: "d2m.tile_add"
+    // CHECK: d2m.tile_nez
+    %0 = "ttir.logical_or"(%lhs, %rhs) : (!ttype, !ttype) -> !ttype
+    return %0 : !ttype
+  }
+
+  // CHECK-LABEL: func @named_logical_xor
+  func.func @named_logical_xor(%lhs: !ttype, %rhs: !ttype) -> (!ttype) {
+    // logical_xor is decomposed into: NEZ(NEZ(a) - NEZ(b)) - exactly one must be non-zero
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "parallel"]
+    // CHECK: d2m.tile_nez
+    // CHECK: d2m.tile_nez
+    // CHECK: "d2m.tile_sub"
+    // CHECK: d2m.tile_nez
+    %0 = "ttir.logical_xor"(%lhs, %rhs) : (!ttype, !ttype) -> !ttype
+    return %0 : !ttype
+  }
+
+  // CHECK-LABEL: func @named_rand
+  func.func @named_rand() -> !ttype {
+    // f32 rand: single d2m.generic + d2m.tile_rand, no cast.
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "parallel"]
+    // CHECK: d2m.tile_rand
+    // CHECK-NOT: d2m.tile_typecast
+    %0 = "ttir.rand"() <{high = 1.000000e+00 : f32, low = 0.000000e+00 : f32, seed = 0 : ui32, size = [128 : i32, 96 : i32]}> : () -> !ttype
+    return %0 : !ttype
+  }
+
+  // CHECK-LABEL: func @named_rand_bf16
+  func.func @named_rand_bf16() -> tensor<128x96xbf16> {
+    // bf16 rand: f32 d2m.tile_rand followed by a d2m.tile_typecast to bf16.
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: d2m.tile_rand
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: d2m.tile_typecast
+    %0 = "ttir.rand"() <{high = 1.000000e+00 : f32, low = 0.000000e+00 : f32, seed = 0 : ui32, size = [128 : i32, 96 : i32]}> : () -> tensor<128x96xbf16>
+    return %0 : tensor<128x96xbf16>
+  }
+
+  // CHECK-LABEL: func @named_rand_i32
+  func.func @named_rand_i32() -> tensor<128x96xi32> {
+    // i32 rand: f32 d2m.tile_rand followed by a d2m.tile_typecast to i32.
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: d2m.tile_rand
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: d2m.tile_typecast
+    %0 = "ttir.rand"() <{high = 1.280000e+02 : f32, low = 0.000000e+00 : f32, seed = 0 : ui32, size = [128 : i32, 96 : i32]}> : () -> tensor<128x96xi32>
+    return %0 : tensor<128x96xi32>
+  }
+
+  // CHECK-LABEL: func.func @named_logical_shifts
+  func.func @named_logical_shifts(%arg0: tensor<128x96xi32>, %arg1: tensor<128x96xi32>) -> tensor<128x96xi32> {
+    // named elementwise op, logical_left_shift:
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "parallel"]
+    // CHECK: d2m.tile_logical_left_shift
+    %0 = "ttir.logical_left_shift"(%arg0, %arg1) : (tensor<128x96xi32>, tensor<128x96xi32>) -> tensor<128x96xi32>
+    // named elementwise op, logical_right_shift:
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "parallel"]
+    // CHECK: d2m.tile_logical_right_shift
+    %1 = "ttir.logical_right_shift"(%0, %arg1) : (tensor<128x96xi32>, tensor<128x96xi32>) -> tensor<128x96xi32>
+    // named elementwise op, right_shift:
+    // CHECK: d2m.generic{{.+}}iterator_types = [#parallel, #parallel]
+    // CHECK: linalg.generic{{.+}}iterator_types = ["parallel", "parallel"]
+    // CHECK: d2m.tile_right_shift
+    %2 = "ttir.right_shift"(%1, %arg1) : (tensor<128x96xi32>, tensor<128x96xi32>) -> tensor<128x96xi32>
+    return %2 : tensor<128x96xi32>
+  }
+}

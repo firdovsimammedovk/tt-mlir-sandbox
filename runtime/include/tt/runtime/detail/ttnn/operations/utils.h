@@ -1,0 +1,82 @@
+// SPDX-FileCopyrightText: (c) 2024 Tenstorrent AI ULC
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#ifndef TT_RUNTIME_DETAIL_TTNN_OPERATIONS_UTILS_H
+#define TT_RUNTIME_DETAIL_TTNN_OPERATIONS_UTILS_H
+
+#include "tt/runtime/detail/ttnn/ttnn.h"
+#include "tt/runtime/detail/ttnn/types/types.h"
+#include "tt/runtime/detail/ttnn/utils.h"
+#include "ttmlir/Target/TTNN/program_generated.h"
+#include "types_generated.h"
+#include <concepts>
+#include <cstdint>
+
+namespace tt::runtime::ttnn::operations::utils {
+
+void eventSync(::ttnn::MeshDevice *meshDevice, const ::ttnn::QueueId &recordCq,
+               const ::ttnn::QueueId &waitCq);
+
+bool isTilized(const ::tt::target::ttnn::TensorRef *tensorRef);
+
+::ttnn::DataType getDataType(const ::tt::target::ttnn::TensorRef *tensorRef);
+
+::ttnn::operations::unary::UnaryOpType
+toTTNNUnaryOpType(::tt::target::ttnn::EltwiseUnaryOpType unaryOpType);
+
+::ttnn::operations::unary::UnaryWithParam
+toTTNNUnaryWithParam(const ::tt::target::ttnn::UnaryWithParam &unaryWithParam);
+
+std::optional<::ttnn::operations::matmul::MatmulProgramConfig>
+createMatmulProgramConfigIfNeeded(const ::tt::target::ttnn::MatmulOp *op);
+
+std::optional<::ttnn::operations::matmul::MatmulProgramConfig>
+createMatmulProgramConfigIfNeeded(const ::tt::target::ttnn::LinearOp *op);
+
+::ttnn::Conv2dConfig
+createConv2dConfig(const ::tt::target::ttnn::Conv2dConfig *memcfg);
+
+::ttnn::Conv2dSliceConfig
+createConv2dSliceConfig(const ::tt::target::ttnn::Conv2dSliceConfig *config);
+
+::ttnn::operations::transformer::SDPAProgramConfig
+createSDPAProgramConfig(const ::tt::target::ttnn::SDPAConfig *config);
+
+::ttnn::DeviceComputeKernelConfig createDeviceComputeKernelConfig(
+    const ::tt::target::ttnn::DeviceComputeKernelConfig *config);
+
+::ttnn::prim::LayerNormProgramConfig
+createLayerNormShardedMultiCoreProgramConfig(
+    const ::tt::target::ttnn::LayerNormShardedMultiCoreProgramConfig *config);
+
+::ttnn::Tensor toTTNNTensor(const ::flatbuffers::Vector<uint8_t> *input,
+                            const ::ttnn::DataType &inputDataType,
+                            const ::ttnn::Shape &shape,
+                            const ::ttnn::DataType &outputDataType,
+                            ::ttnn::MeshDevice *meshDevice,
+                            const ::ttnn::Layout &layout,
+                            const ::ttnn::MemoryConfig &memoryConfig);
+
+::ttnn::Tensor
+allocateTensorOnDevice(const ::tt::target::ttnn::TensorRef *tensorRef,
+                       ::ttnn::MeshDevice &meshDevice);
+
+std::vector<::tt::runtime::GlobalSemaphore> collectSemaphoreInputs(
+    const ::flatbuffers::Vector<
+        ::flatbuffers::Offset<::tt::target::ttnn::GlobalSemaphoreRef>>
+        *semaphoreInputs,
+    ProgramContext &context);
+
+template <std::integral T>
+inline ::ttnn::Shape toTTNNShape(const flatbuffers::Vector<T> &vec) {
+  std::vector<uint32_t> rawShape;
+  rawShape.reserve(vec.size());
+  std::transform(
+      vec.begin(), vec.end(), std::back_inserter(rawShape),
+      [](const T &x) -> uint32_t { return static_cast<uint32_t>(x); });
+  return ::ttnn::Shape(rawShape);
+}
+
+} // namespace tt::runtime::ttnn::operations::utils
+#endif

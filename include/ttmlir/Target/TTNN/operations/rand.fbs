@@ -1,0 +1,16 @@
+include "ttmlir/Target/Common/types.fbs";
+include "ttmlir/Target/TTNN/types.fbs";
+
+namespace tt.target.ttnn;
+
+table RandOp {
+  device: tt.target.DeviceRef;
+  size: [int64];
+  low: float;
+  high: float;
+  seed: uint32;
+  dtype: tt.target.DataType;
+  layout: tt.target.TensorLayout;
+  memcfg: tt.target.ttnn.MemoryConfig;
+  out: tt.target.ttnn.TensorRef;
+}

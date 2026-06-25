@@ -1,0 +1,20 @@
+// RUN: not ttmlir-opt --split-input-file %s 2>&1 | FileCheck %s
+// Negative test for cumulative sum operation
+
+module attributes {} {
+  func.func public @test_cumsum_neg_dim(%arg0: tensor<1x32x128x128xbf16>) -> tensor<1x32x128x128xbf16> {
+    // CHECK: error: 'ttir.cumsum' op specified dimension should be between -4 and 3, but got: -6
+    %1 = "ttir.cumsum"(%arg0) <{dim = -6 : i64}> : (tensor<1x32x128x128xbf16>) -> tensor<1x32x128x128xbf16>
+    return %1 : tensor<1x32x128x128xbf16>
+  }
+}
+
+// -----
+
+module attributes {} {
+  func.func public @test_cumsum_high_dim(%arg0: tensor<1x32x128xbf16>) -> tensor<1x32x128xbf16> {
+    // CHECK: error: 'ttir.cumsum' op specified dimension should be between -3 and 2, but got: 4
+    %1 = "ttir.cumsum"(%arg0) <{dim = 4 : i64}> : (tensor<1x32x128xbf16>) -> tensor<1x32x128xbf16>
+    return %1 : tensor<1x32x128xbf16>
+  }
+}

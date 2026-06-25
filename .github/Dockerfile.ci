@@ -1,0 +1,41 @@
+ARG FROM_TAG=latest
+
+FROM ghcr.io/tenstorrent/tt-mlir/tt-mlir-base-ubuntu-24-04:${FROM_TAG} AS ci-build
+SHELL ["/bin/bash", "-c"]
+
+# Create a directory for the build and toolchain
+ENV PROJECT_NAME=tt-mlir
+ENV BUILD_DIR=/home/build
+ENV TTMLIR_TOOLCHAIN_DIR=/opt/ttmlir-toolchain
+
+RUN echo "Building $PROJECT_NAME"
+
+RUN mkdir -p $BUILD_DIR && \
+    mkdir -p $TTMLIR_TOOLCHAIN_DIR
+
+# Copy the project to the container
+ADD . $BUILD_DIR/$PROJECT_NAME
+
+# Build the toolchain
+WORKDIR $BUILD_DIR/$PROJECT_NAME
+
+# Show last commit
+RUN git log -1
+
+RUN <<EOT
+export CMAKE_BUILD_PARALLEL_LEVEL=12
+# ANCHOR: environment_build
+cmake -B env/build env -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+cmake --build env/build
+# ANCHOR_END: environment_build
+EOT
+
+# Final stage
+FROM ghcr.io/tenstorrent/tt-mlir/tt-mlir-base-ubuntu-24-04:${FROM_TAG} AS ci
+
+# Copy the TTMLIR_TOOLCHAIN_DIR from the previous stage
+ENV TTMLIR_TOOLCHAIN_DIR=/opt/ttmlir-toolchain
+RUN echo "Copying from ci-build stage $TTMLIR_TOOLCHAIN_DIR"
+COPY --from=ci-build $TTMLIR_TOOLCHAIN_DIR $TTMLIR_TOOLCHAIN_DIR
+
+RUN du -h --max-depth=2 $TTMLIR_TOOLCHAIN_DIR

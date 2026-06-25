@@ -1,0 +1,23 @@
+// RUN: ttmlir-opt --ttir-to-ttmetal-pipeline="system-desc-path=%system_desc_path% collapse-tensors-2d=false" -o %t.mlir %s
+// RUN: FileCheck %s --input-file=%t.mlir
+// RUN: ttmlir-translate --ttmetal-to-flatbuffer -o %t.ttm %t.mlir
+
+func.func @add(%arg0: tensor<3x32x64xf32>, %arg1: tensor<3x32x64xf32>) -> tensor<3x32x64xf32> {
+  %0 = ttir.empty() : tensor<3x32x64xf32>
+
+  // CHECK: "ttmetal.create_buffer"() <{address = {{[0-9]+}} : i64, virtualGridForwardMapping = #map{{[0-9]*}}, virtualGridInverseMapping = #map{{[0-9]*}}}> : () -> memref<3x1x2x1x1x1x!ttcore.tile<32x32, f32>, #ttcore.shard<4096x4096x4096, 1>, #l1>
+  // CHECK: "ttmetal.create_buffer"() <{address = {{[0-9]+}} : i64, virtualGridForwardMapping = #map{{[0-9]*}}, virtualGridInverseMapping = #map{{[0-9]*}}}> : () -> memref<3x1x2x1x32x32xf32, #ttcore.shard<4096x128x4, 1>, #l1>
+  // CHECK: "ttmetal.enqueue_write_buffer"(%arg0, {{.*}}) : (memref<3x32x64xf32>, memref<3x1x2x1x32x32xf32, #ttcore.shard<4096x128x4, 1>, #l1>)
+
+  // CHECK: "ttmetal.create_buffer"() <{address = {{[0-9]+}} : i64, virtualGridForwardMapping = #map{{[0-9]*}}, virtualGridInverseMapping = #map{{[0-9]*}}}> : () -> memref<3x1x2x1x1x1x!ttcore.tile<32x32, f32>, #ttcore.shard<4096x4096x4096, 1>, #l1>
+  // CHECK: "ttmetal.create_buffer"() <{address = {{[0-9]+}} : i64, virtualGridForwardMapping = #map{{[0-9]*}}, virtualGridInverseMapping = #map{{[0-9]*}}}> : () -> memref<3x1x2x1x32x32xf32, #ttcore.shard<4096x128x4, 1>, #l1>
+  // CHECK: "ttmetal.enqueue_write_buffer"(%arg1, {{.*}}) : (memref<3x32x64xf32>, memref<3x1x2x1x32x32xf32, #ttcore.shard<4096x128x4, 1>, #l1>)
+
+  // CHECK: "ttmetal.enqueue_program"
+  %1 = "ttir.add"(%arg0, %arg1) : (tensor<3x32x64xf32>, tensor<3x32x64xf32>) -> tensor<3x32x64xf32>
+
+  // CHECK: "ttmetal.enqueue_read_buffer"({{.*}}, {{.*}}) : (memref<3x1x2x1x32x32xf32, #ttcore.shard<4096x128x4, 1>, #l1>, memref<3x32x64xf32>)
+
+  // CHECK: "ttmetal.finish"
+  return %1 : tensor<3x32x64xf32>
+}

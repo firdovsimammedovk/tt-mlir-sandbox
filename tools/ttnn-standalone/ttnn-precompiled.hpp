@@ -1,0 +1,329 @@
+// SPDX-FileCopyrightText: (c) 2024 Tenstorrent AI ULC
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#ifndef TOOLS_TTNN_STANDALONE_TTNN_PRECOMPILED_HPP
+#define TOOLS_TTNN_STANDALONE_TTNN_PRECOMPILED_HPP
+
+// ANCHOR: standalone_includes
+#include "operations/ccl/all_gather/all_gather.hpp"
+#include "operations/ccl/all_to_all_combine/all_to_all_combine.hpp"
+#include "operations/ccl/all_to_all_dispatch/all_to_all_dispatch.hpp"
+#include "operations/ccl/ccl_host_types.hpp"
+#include "operations/conv/conv2d/conv2d.hpp"
+#include "operations/conv/conv2d/prepare_conv2d_weights.hpp"
+#include "operations/conv/conv_transpose2d/conv_transpose2d.hpp"
+#include "operations/core/core.hpp"
+#include "operations/creation/creation.hpp"
+#include "operations/data_movement/concat/concat.hpp"
+#include "operations/data_movement/gather/gather.hpp"
+#include "operations/data_movement/moe_expert_token_remap/moe_expert_token_remap.hpp"
+#include "operations/data_movement/pad/pad.hpp"
+#include "operations/data_movement/permute/permute.hpp"
+#include "operations/data_movement/repeat/repeat.hpp"
+#include "operations/data_movement/repeat_interleave/repeat_interleave.hpp"
+#include "operations/data_movement/reshape_view/reshape.hpp"
+#include "operations/data_movement/scatter/scatter.hpp"
+#include "operations/data_movement/slice/slice.hpp"
+#include "operations/data_movement/sort/sort.hpp"
+#include "operations/data_movement/transpose/transpose.hpp"
+#include "operations/eltwise/binary/binary.hpp"
+#include "operations/eltwise/binary/binary_composite.hpp"
+#include "operations/eltwise/quantization/quantization.hpp"
+#include "operations/eltwise/unary/unary_composite.hpp"
+#include "operations/embedding/embedding.hpp"
+#include "operations/embedding_backward/embedding_backward.hpp"
+#include "operations/experimental/ccl/all_reduce_async/all_reduce_async.hpp"
+#include "operations/experimental/ccl/all_to_all_dispatch_metadata/all_to_all_dispatch_metadata.hpp"
+#include "operations/experimental/ccl/moe_gpt/moe_gpt.hpp"
+#include "operations/experimental/ccl/rms_allgather/rms_allgather.hpp"
+#include "operations/experimental/conv3d/conv3d.hpp"
+#include "operations/experimental/conv3d/prepare_conv3d_weights.hpp"
+#include "operations/experimental/dropout/dropout.hpp"
+#include "operations/experimental/transformer/nlp_concat_heads/nlp_concat_heads.hpp"
+#include "operations/experimental/unary_backward/gelu_backward/gelu_backward.hpp"
+#include "operations/kv_cache/kv_cache.hpp"
+#include "operations/matmul/matmul.hpp"
+#include "operations/normalization/batch_norm/batch_norm.hpp"
+#include "operations/normalization/groupnorm/groupnorm.hpp"
+#include "operations/normalization/layernorm/layernorm.hpp"
+#include "operations/normalization/layernorm_distributed/layernorm_post_all_gather.hpp"
+#include "operations/normalization/layernorm_distributed/layernorm_pre_all_gather.hpp"
+#include "operations/normalization/rmsnorm/rmsnorm.hpp"
+#include "operations/normalization/rmsnorm_distributed/rmsnorm_pre_all_gather.hpp"
+#include "operations/normalization/softmax/softmax.hpp"
+#include "operations/pool/generic/generic_pools.hpp"
+#include "operations/pool/upsample/upsample.hpp"
+#include "operations/rand/rand.hpp"
+#include "operations/reduction/accumulation/cumsum/cumsum.hpp"
+#include "operations/reduction/argmax/argmax.hpp"
+#include "operations/reduction/generic/generic_reductions.hpp"
+#include "operations/reduction/prod/prod.hpp"
+#include "operations/trace.hpp"
+#include "operations/transformer/concatenate_heads/concatenate_heads.hpp"
+#include "operations/transformer/sdpa/sdpa.hpp"
+#include "operations/transformer/sdpa_decode/sdpa_decode.hpp"
+#include "operations/transformer/split_query_key_value_and_split_heads/split_query_key_value_and_split_heads.hpp"
+#include "tt-metalium/bfloat16.hpp"
+#include "ttnn/common/queue_id.hpp"
+#include "ttnn/core.hpp"
+#include "ttnn/device.hpp"
+#include "ttnn/global_semaphore.hpp"
+#include "ttnn/operations/copy/typecast/typecast.hpp"
+#include "ttnn/operations/experimental/paged_cache/paged_cache.hpp"
+#include "ttnn/operations/experimental/topk_router_gpt/topk_router_gpt.hpp"
+#include "ttnn/operations/experimental/transformer/nlp_concat_heads_decode/nlp_concat_heads_decode.hpp"
+#include "ttnn/operations/experimental/transformer/nlp_create_qkv_heads_decode/nlp_create_qkv_heads_decode.hpp"
+#include "ttnn/operations/experimental/transformer/rotary_embedding/rotary_embedding.hpp"
+#include "ttnn/operations/experimental/transformer/rotary_embedding_llama/rotary_embedding_llama.hpp"
+#include "ttnn/operations/normalization/layernorm/layernorm.hpp"
+#include "ttnn/operations/reduction/accumulation/cumprod/cumprod.hpp"
+#include "ttnn/operations/reduction/sampling/sampling.hpp"
+#include "ttnn/operations/reduction/topk/topk.hpp"
+#include "ttnn/tensor/serialization.hpp"
+#include "ttnn/tensor/tensor.hpp"
+#include "ttnn/tensor/types.hpp"
+#include "ttnn/types.hpp"
+#include "workarounds.hpp"
+// ANCHOR_END: standalone_includes
+
+#include <array>
+#include <cassert>
+#include <cstddef>
+#include <iostream>
+#include <limits>
+#include <tuple>
+#include <vector>
+
+template <typename... T>
+std::vector<ttnn::Tensor> util_create_vec(T &&...t) {
+  return std::vector<ttnn::Tensor>{std::forward<T>(t)...};
+}
+
+namespace ttnn {
+
+// DeviceGetter class
+//
+// Singleton implementation for Device
+//
+class DeviceGetter {
+public:
+  static constexpr std::size_t l1SmallSize = 1 << 15; // 32kB
+  static constexpr std::size_t traceRegionSize = 0;
+
+  static ttnn::MeshDevice *getInstance() {
+    // If we have an external device, use it.
+    if (externalDevice) {
+      assert(!hasOwnedDevice);
+      return externalDevice;
+    }
+
+    // NOTE: `ownedInstance` is intentionally `thread_local` (not a plain
+    // function-local static) to avoid a use-after-free crash during process
+    // exit. thread_local variables are destroyed when the thread exits,
+    // which happens before static destruction begins. This guarantees that
+    // GraphTracker (a function-local static in libtt_metal.so, initialized
+    // lazily during the first op) is still alive when the MeshDevice's
+    // program cache is destroyed. With a plain static, GraphTracker could
+    // be destroyed first (reverse init order), causing ProgramImpl's
+    // destructor to crash in deallocate_circular_buffers().
+    static thread_local std::shared_ptr<ttnn::MeshDevice> ownedInstance =
+        ::ttnn::MeshDevice::create_unit_mesh(0, l1SmallSize, traceRegionSize);
+    hasOwnedDevice = true;
+    return ownedInstance.get();
+  }
+
+  // Set an external device (we don't own it)
+  static void setInstance(ttnn::MeshDevice *newInstance) {
+    // We don't want to mix and match owned/external devices.
+    assert(!hasOwnedDevice);
+
+    // Store the external device pointer.
+    externalDevice = newInstance;
+  }
+
+private:
+  DeviceGetter() = default;
+
+  DeviceGetter(const DeviceGetter &) = delete;
+  DeviceGetter &operator=(const DeviceGetter &) = delete;
+
+  // External device (not owned by us).
+  static ttnn::MeshDevice *externalDevice;
+  // Flag to track if we've set local ownedInstance or not.
+  static bool hasOwnedDevice;
+};
+
+inline ttnn::MeshDevice *DeviceGetter::externalDevice = nullptr;
+inline bool DeviceGetter::hasOwnedDevice = false;
+
+// Function to be exported from the dylib that can be called to set the
+// device--extern to avoid mangling.
+extern "C" {
+void setDevice(ttnn::MeshDevice *device) { DeviceGetter::setInstance(device); }
+}
+
+// Registry for all const-eval cache vectors.
+// Using a thread_local function-local static (Meyers singleton) ensures this
+// is destroyed before the thread_local device during thread exit. thread_local
+// variables are destroyed in reverse initialization order within the same
+// thread, so since the device is initialized before the registry, the registry
+// is destroyed first — clearing all cached tensors while the device and
+// GraphTracker are still alive.
+class ConstEvalCacheRegistry {
+public:
+  static ConstEvalCacheRegistry &instance() {
+    static thread_local ConstEvalCacheRegistry reg;
+    return reg;
+  }
+
+  void registerCache(std::vector<ttnn::Tensor> *cache) {
+    caches_.push_back(cache);
+  }
+
+  ~ConstEvalCacheRegistry() {
+    for (auto *cache : caches_) {
+      cache->clear();
+    }
+  }
+
+private:
+  std::vector<std::vector<ttnn::Tensor> *> caches_;
+};
+
+// Wrapper to abstract const-eval logic out of runtime funcs to keep them
+// cleaner. Invokes constEvalFunc iff outputs is empty.
+void constEvalFuncWrapper(
+    std::function<std::vector<ttnn::Tensor>(std::vector<ttnn::Tensor>)>
+        constEvalFunc,
+    const std::vector<ttnn::Tensor> &inputs,
+    std::vector<ttnn::Tensor> *outputs) {
+  if (outputs->empty()) {
+    *outputs = constEvalFunc(inputs);
+    ConstEvalCacheRegistry::instance().registerCache(outputs);
+  }
+}
+
+// Wrapper to abstract const-eval logic out of runtime funcs to keep them
+// cleaner. Invokes constEvalFunc iff outputs is empty.
+// This is an overload of constEvalFuncWrapper for const-eval functions that
+// take zero arguments.
+void constEvalFuncWrapperZeroArg(
+    std::function<std::vector<ttnn::Tensor>()> constEvalFunc,
+    // const std::vector<ttnn::Tensor> &inputs,
+    std::vector<ttnn::Tensor> *outputs) {
+  if (outputs->empty()) {
+    *outputs = constEvalFunc();
+    ConstEvalCacheRegistry::instance().registerCache(outputs);
+  }
+}
+
+uint32_t getScalarFromTensor(const ttnn::Tensor &tensor) {
+  assert(tensor.logical_volume() == 1 && "expected scalar tensor");
+  assert(tensor.dtype() == ttnn::DataType::UINT32 && "expected uint32 tensor");
+
+  const ::ttnn::Tensor tensorOnHost = ::ttnn::from_device(tensor);
+  const ::tt::tt_metal::HostBuffer buffer =
+      ::tt::tt_metal::host_buffer::get_host_buffer(tensorOnHost);
+  const auto &buf = buffer.view_as<uint32_t>();
+  return *buf.begin();
+}
+
+::ttnn::Tensor loadTensor(const std::string &filePath, ttnn::Layout layout,
+                          ttnn::DataType dtype, ttnn::MeshDevice *device,
+                          ttnn::MemoryConfig memoryConfig) {
+  ::ttnn::Tensor loadedTensor =
+      ::tt::tt_metal::load_tensor_flatbuffer(filePath);
+
+  assert(loadedTensor.device() == nullptr && "loaded tensor must be on host");
+
+  if (loadedTensor.dtype() != dtype) {
+    loadedTensor = ::ttnn::to_dtype(loadedTensor, dtype);
+  }
+
+  if (loadedTensor.layout() != layout) {
+    loadedTensor = ::ttnn::to_layout(loadedTensor, layout);
+  }
+
+  if (device != nullptr) {
+    loadedTensor = ::ttnn::to_device(loadedTensor, device, memoryConfig);
+  }
+
+  return loadedTensor;
+}
+
+// Wrapper for nlp_create_qkv_heads_decode that handles the non-const lvalue
+// reference parameter. The tt-metal API takes optional_output_tensors as a
+// non-const lvalue reference, which can't be passed as a temporary. This
+// wrapper creates a local variable internally.
+inline std::tuple<::ttnn::Tensor, ::ttnn::Tensor, ::ttnn::Tensor>
+nlp_create_qkv_heads_decode_wrapper(
+    const ::ttnn::Tensor &input_tensor, uint32_t num_heads,
+    std::optional<const uint32_t> num_kv_heads,
+    std::optional<const bool> overlap_qk_coregrid = true,
+    const std::optional<const ::ttnn::Tensor> &batch_offset = std::nullopt,
+    std::optional<const uint32_t> slice_size = std::nullopt,
+    const std::optional<::ttnn::MemoryConfig> &memory_config = std::nullopt) {
+  std::optional<std::array<::ttnn::Tensor, 3>> optional_output_tensors;
+  return ::ttnn::experimental::nlp_create_qkv_heads_decode(
+      input_tensor, num_heads, num_kv_heads, optional_output_tensors,
+      overlap_qk_coregrid, batch_offset, slice_size, memory_config);
+}
+
+// Helper for distributed RMS norm EmitC support.
+// TODO(amilovanovic): Remove this once the following issue is fixed in
+// tt-metal: https://github.com/tenstorrent/tt-metal/issues/38212
+::ttnn::GlobalSemaphore createGlobalSemaphore(const ::ttnn::Tensor &input) {
+  auto shardSpec = input.shard_spec();
+  assert(shardSpec.has_value() &&
+         "Input tensor must have shard spec for createGlobalSemaphore");
+  return ::ttnn::global_semaphore::create_global_semaphore(input.device(),
+                                                           shardSpec->grid, 0);
+}
+
+} // namespace ttnn
+
+namespace ttmlir::standalone {
+
+inline ::ttnn::Tensor
+global_avg_pool2d(const ::ttnn::Tensor &inputTensor,
+                  const std::optional<const ::ttnn::MemoryConfig> &memoryConfig,
+                  const std::optional<::ttnn::DataType> &dtype) {
+  ::ttnn::Tensor input = inputTensor;
+  auto shape = input.logical_shape();
+  assert(shape.rank() == 4 && "global_avg_pool2d expects NHWC rank 4 input");
+
+  const uint32_t batchSize = shape[0];
+  const uint32_t inputHeight = shape[1];
+  const uint32_t inputWidth = shape[2];
+  const uint32_t channels = shape[3];
+
+  if (input.memory_config().is_sharded()) {
+    input = ::ttnn::to_memory_config(
+        input, ::ttnn::MemoryConfig(::ttnn::TensorMemoryLayout::INTERLEAVED,
+                                    input.memory_config().buffer_type()));
+  }
+
+  ::ttnn::Tensor result = ::ttnn::avg_pool2d(
+      input, batchSize, inputHeight, inputWidth, channels,
+      /*kernel_size=*/std::array<uint32_t, 2>{inputHeight, inputWidth},
+      /*stride=*/std::array<uint32_t, 2>{1, 1},
+      /*padding=*/std::array<uint32_t, 2>{0, 0}, /*ceil_mode=*/false,
+      /*count_include_pad=*/true, /*divisor_override=*/std::nullopt,
+      memoryConfig, /*dram_slice_config=*/std::nullopt,
+      /*applied_shard_scheme=*/std::nullopt,
+      /*compute_kernel_config=*/std::nullopt,
+      /*deallocate_input=*/false, /*reallocate_halo_output=*/true,
+      dtype.value_or(::ttnn::DataType::BFLOAT16), ::ttnn::Layout::TILE,
+      /*config_tensor_in_dram=*/false);
+
+  std::optional<::ttnn::MemoryConfig> reshapeMemoryConfig =
+      memoryConfig ? std::make_optional<::ttnn::MemoryConfig>(*memoryConfig)
+                   : std::nullopt;
+  return ::ttnn::reshape(result, ::ttnn::Shape({batchSize, 1, 1, channels}),
+                         reshapeMemoryConfig);
+}
+
+} // namespace ttmlir::standalone
+
+#endif // TOOLS_TTNN_STANDALONE_TTNN_PRECOMPILED_HPP
