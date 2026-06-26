@@ -36,22 +36,7 @@ exclude_patterns = [
     "specs/tensor-layout-interactive.html",
 ]
 
-# -- Versioning --------------------------------------------------------------
-
-def _git_tags():
-    try:
-        out = subprocess.check_output(
-            ["git", "tag", "-l", "v*", "--sort=-version:refname"],
-            stderr=subprocess.DEVNULL,
-        ).decode().strip()
-        return [t for t in out.split("\n") if t]
-    except Exception:
-        return []
-
 _MLIR_BASE = "https://firdovsimammedovk.github.io/tt-mlir-sandbox/"
-_current_version = os.environ.get("DOCS_VERSION", "latest")
-_all_versions = ["latest"] + [t for t in _git_tags() if t != "latest"]
-_version_urls = [(v, f"{_MLIR_BASE}{v}/") for v in _all_versions]
 
 # -- Options for HTML output -------------------------------------------------
 
@@ -65,17 +50,14 @@ html_logo = "_static/tt_logo.svg"
 html_favicon = "_static/favicon.png"
 html_static_path = ["_static"]
 html_css_files = ["https://firdovsimammedovk.github.io/tenstorrent-sandbox/_static/tt_theme.css"]
-html_baseurl = f"{_MLIR_BASE}{_current_version}/"
+# Single-version site: published at a flat path, no version switcher.
+html_baseurl = _MLIR_BASE
 html_last_updated_fmt = "%b %d, %Y"
 
 sitemap_locales = [None]
 sitemap_url_scheme = "{link}"
 
 html_context = {
-    "versions": _version_urls,
-    "current_version": _current_version,
     "logo_link_url": "https://firdovsimammedovk.github.io/tenstorrent-sandbox/",
     "search_site_base_url": _MLIR_BASE,
 }
-
-version = _current_version
